@@ -19,7 +19,6 @@ spec:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: PlacementDecision is the Schema for the placementdecisions API.
         properties:
           apiVersion:
             description: |-
@@ -39,16 +38,72 @@ spec:
           metadata:
             type: object
           spec:
-            description: PlacementDecisionSpec defines the desired state of PlacementDecision.
             properties:
+              allowedClusters:
+                items:
+                  type: string
+                type: array
               preferred:
                 items:
                   type: string
                 type: array
+              weights:
+                description: 가중치 설정 (모두 0~1000 범위의 밀리 스케일; 합이 1000일 필요는 없음)
+                properties:
+                  cpu:
+                    format: int32
+                    maximum: 1000
+                    minimum: 0
+                    type: integer
+                  gpu:
+                    format: int32
+                    maximum: 1000
+                    minimum: 0
+                    type: integer
+                  hysteresis:
+                    description: 선택 유지 히스테리시스 임계값 (점수 차이 이 값 미만이면 기존 선택 유지)
+                    format: int32
+                    maximum: 1000
+                    minimum: 0
+                    type: integer
+                  latency:
+                    format: int32
+                    maximum: 1000
+                    minimum: 0
+                    type: integer
+                  mem:
+                    format: int32
+                    maximum: 1000
+                    minimum: 0
+                    type: integer
+                type: object
             type: object
           status:
-            description: PlacementDecisionStatus defines the observed state of PlacementDecision.
             properties:
+              debug:
+                properties:
+                  promURL:
+                    type: string
+                  queries:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
+              eventInfra:
+                description: ★ EventInfraStatus는 중첩 타입(리소스 아님). 절대 object:root 마커
+                  넣지 않기!
+                properties:
+                  busURL:
+                    type: string
+                  eventBusHome:
+                    type: string
+                  globalNatsServiceName:
+                    type: string
+                  natsBackendSelector:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
               reason:
                 type: string
               scores:
@@ -57,13 +112,11 @@ spec:
                     cluster:
                       type: string
                     cpu:
-                      description: 0~1000 (0.000~1.000) 범위의 밀리 단위 점수
                       format: int32
                       maximum: 1000
                       minimum: 0
                       type: integer
                     final:
-                      description: 최종 점수 (가중합 등), 동일 스케일
                       format: int32
                       maximum: 1000
                       minimum: 0

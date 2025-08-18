@@ -1,3 +1,5 @@
+// internal/controller/orchestrator_controller.go
+
 /*
 Copyright 2025.
 
@@ -56,7 +58,8 @@ type OrchestratorReconciler struct {
 // +kubebuilder:rbac:groups=argoproj.io,resources=eventsources;sensors;workflowtemplates,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=serving.knative.dev,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy.karmada.io,resources=propagationpolicies;overridepolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps;services;endpoints,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=argoproj.io,resources=eventbus;eventbuses,verbs=get;list;watch;create;update;patch;delete
 
 // ──────────────────────────────────────────────────────────────
 // cluster → endpoint 매핑(ConfigMap: orchestrator-domain-map in spec.namespace)
@@ -109,6 +112,7 @@ func (r *OrchestratorReconciler) loadDomainMap(ctx context.Context, ns string) (
 }
 
 // ──────────────────────────────────────────────────────────────
+
 func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var orch orchestrationv1alpha1.Orchestrator
 	if err := r.Get(ctx, req.NamespacedName, &orch); err != nil {
@@ -133,6 +137,7 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, nameWT(orch.Spec.EventName), "argoproj.io/v1alpha1", "WorkflowTemplate")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePP(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName), "policy.karmada.io/v1alpha1", "OverridePolicy")
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, "default", "argoproj.io/v1alpha1", "EventBus")
 
 		controllerutil.RemoveFinalizer(&orch, orchestratorFinalizer)
 		_ = r.Update(ctx, &orch)
@@ -142,6 +147,10 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// 0) 기본값
 	r.defaultSpec(&orch)
 
+	// (추가) EventBus를 먼저 보장
+	if err := r.ensureManagedEventBus(ctx, &orch); err != nil {
+		return r.fail(&orch, "EnsureEventBusFailed", err)
+	}
 	// 1) 베이스 리소스(ksvc / eventsource / wt / sensor)부터 생성
 	ksvcURL, err := r.ensureKnativeServiceAndURL(ctx, &orch, nil)
 	if err != nil {
@@ -155,7 +164,6 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	r.setCond(&orch, "EventSourceServiceReady", metav1.ConditionTrue, "Applied", "ok")
 
 	baseObjs := r.renderBase(&orch, ksvcURL) // WT, Sensor
-	// OwnerReference 추가
 	for _, o := range baseObjs {
 		setOwner(&orch, o, r.Scheme)
 	}
@@ -177,13 +185,18 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// 3) PD가 선택되었으면 PP/OP 생성
+	// 3) PD가 선택되었으면 PP/OP 생성 (WT URL OP 포함)
 	policyObjs := r.renderPolicies(&orch, pd)
 	for _, o := range policyObjs {
 		setOwner(&orch, o, r.Scheme)
 	}
 	if err := r.applyAll(ctx, policyObjs); err != nil {
 		return r.fail(&orch, "ApplyPoliciesFailed", err)
+	}
+
+	// 3-1) Managed EventBus 보장 (spec.jetstream.version=latest)
+	if err := r.ensureManagedEventBus(ctx, &orch); err != nil {
+		return r.fail(&orch, "EnsureEventBusFailed", err)
 	}
 
 	// 4) Status 최종 업데이트
@@ -215,7 +228,6 @@ func (r *OrchestratorReconciler) defaultSpec(o *orchestrationv1alpha1.Orchestrat
 		o.Spec.EventType = "webhook"
 	}
 	if o.Spec.EventLogic == "" {
-		// 논리 미지정 시: 단일 이벤트 이름으로 조건 구성 (Sensor dependency 키와 동일)
 		o.Spec.EventLogic = o.Spec.EventName
 	}
 	if o.Spec.EventSource == nil {
@@ -240,6 +252,10 @@ func (r *OrchestratorReconciler) defaultSpec(o *orchestrationv1alpha1.Orchestrat
 	if o.Spec.Service.DomainSuffix == "" {
 		o.Spec.Service.DomainSuffix = "example.com"
 	}
+	if o.Spec.Service.ConcurrencyTarget != nil && *o.Spec.Service.ConcurrencyTarget < 1 {
+		v := int32(1)
+		o.Spec.Service.ConcurrencyTarget = &v
+	}
 	if o.Spec.Service.ConcurrencyTarget == nil {
 		v := int32(10)
 		o.Spec.Service.ConcurrencyTarget = &v
@@ -247,9 +263,6 @@ func (r *OrchestratorReconciler) defaultSpec(o *orchestrationv1alpha1.Orchestrat
 }
 
 // ──────────────────────────────────────────────────────────────
-// Placement
-// ──────────────────────────────────────────────────────────────
-
 func (r *OrchestratorReconciler) ensurePlacement(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator) (*orchestrationv1alpha1.PlacementDecision, error) {
 	name := fmt.Sprintf("%s-pd", orch.Name)
 	var pd orchestrationv1alpha1.PlacementDecision
@@ -288,7 +301,6 @@ func (r *OrchestratorReconciler) ensureKnativeServiceAndURL(ctx context.Context,
 	if err := r.applyAll(ctx, []*uobj.Unstructured{ksvc}); err != nil {
 		return "", err
 	}
-	// Placeholder: 멤버별 OverridePolicy로 실제 외부 URL로 교체될 값
 	return fmt.Sprintf("http://%s.%s.svc", nameKS(orch.Spec.EventName), orch.Spec.Namespace), nil
 }
 
@@ -298,7 +310,6 @@ func (r *OrchestratorReconciler) ensureEventSourceNodePort(ctx context.Context, 
 	if err := r.applyAll(ctx, []*uobj.Unstructured{es}); err != nil {
 		return 0, err
 	}
-	// NodePort 서비스가 필요하면 추가(옵션: Cilium Global Service)
 	svc := renderEventSourceNodePortService(orch)
 	if svc != nil {
 		setOwner(orch, svc, r.Scheme)
@@ -330,7 +341,6 @@ func (r *OrchestratorReconciler) renderPolicies(
 	pd *orchestrationv1alpha1.PlacementDecision,
 ) []*uobj.Unstructured {
 	pp := renderPropagationPolicy(orch, pd)
-	// 멤버별 도메인/포트 매핑 로드 (없어도 PP만 생성되게)
 	domap, err := r.loadDomainMap(context.Background(), orch.Spec.Namespace)
 	if err != nil {
 		return []*uobj.Unstructured{pp}
@@ -400,11 +410,38 @@ func (r *OrchestratorReconciler) fail(orch *orchestrationv1alpha1.Orchestrator, 
 }
 
 // ──────────────────────────────────────────────────────────────
+// Managed EventBus
+// ──────────────────────────────────────────────────────────────
+
+func (r *OrchestratorReconciler) ensureManagedEventBus(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator) error {
+	eb := renderEventBusManaged(orch)
+	setOwner(orch, eb, r.Scheme)
+	return r.applyAll(ctx, []*uobj.Unstructured{eb})
+}
+
+func renderEventBusManaged(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
+	u := &uobj.Unstructured{}
+	u.Object = map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "EventBus",
+		"metadata": map[string]any{
+			"name":      "default",
+			"namespace": orch.Spec.Namespace,
+		},
+		"spec": map[string]any{
+			"jetstream": map[string]any{
+				"version": "latest",
+			},
+		},
+	}
+	return u
+}
+
+// ──────────────────────────────────────────────────────────────
 // Renderers
 // ──────────────────────────────────────────────────────────────
 
 func renderKService(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
-	// 컨테이너 정의 (env는 비어있으면 키 자체 생략)
 	container := map[string]any{
 		"image": orch.Spec.Service.Image,
 	}
@@ -420,7 +457,6 @@ func renderKService(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured
 		},
 	}
 
-	// Concurrency Target annotation
 	if orch.Spec.Service.ConcurrencyTarget != nil {
 		tmpl := spec["template"].(map[string]any)
 		if tmpl["metadata"] == nil {
@@ -476,7 +512,6 @@ func renderEventSource(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructu
 }
 
 func renderEventSourceNodePortService(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
-	// NodePort가 필요없으면 nil
 	if orch.Spec.EventSource.NodePort == 0 && !orch.Spec.Network.UseGlobalService {
 		return nil
 	}
@@ -547,7 +582,7 @@ func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, ksvcURL st
 				map[string]any{
 					"name": "call-func",
 					"http": map[string]any{
-						"url":    ksvcURL, // OverridePolicy로 멤버별 외부 URL로 교체
+						"url":    ksvcURL,
 						"method": "GET",
 						"headers": []any{
 							map[string]any{"name": "Content-Type", "value": "application/json"},
@@ -630,6 +665,7 @@ func renderPropagationPolicy(orch *orchestrationv1alpha1.Orchestrator, pd *orche
 				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "Sensor", "name": nameSN(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
 				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "WorkflowTemplate", "name": nameWT(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
 				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventSource", "name": nameES(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventBus", "name": "default", "namespace": orch.Spec.Namespace},
 			},
 			"placement": map[string]any{
 				"clusterAffinity": map[string]any{
@@ -664,10 +700,10 @@ func renderOverridePolicyForWT(
 
 		rules = append(rules, map[string]any{
 			"targetCluster": map[string]any{
-				"clusterNames": []any{c}, // Karmada: targetCluster.clusterNames
+				"clusterNames": []any{c},
 			},
 			"overriders": map[string]any{
-				"plaintext": []any{ // Karmada: overriders.plaintext
+				"plaintext": []any{
 					map[string]any{
 						"path":     "/spec/templates/1/http/url",
 						"operator": "replace",
@@ -706,7 +742,7 @@ func renderOverridePolicyForWT(
 
 func toEnvList(m map[string]string) []any {
 	if len(m) == 0 {
-		return []any{} // null 대신 빈 배열
+		return []any{}
 	}
 	out := make([]any, 0, len(m))
 	for k, v := range m {
