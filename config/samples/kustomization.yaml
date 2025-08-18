@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- orchestration_v1alpha1_orchestrator.yaml
+- orchestration_v1alpha1_placementdecision.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

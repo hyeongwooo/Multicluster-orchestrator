@@ -1,0 +1,13 @@
+apiVersion: orchestration.operator.io/v1alpha1
+kind: Orchestrator
+metadata:
+  labels:
+    app.kubernetes.io/name: orchestrator
+    app.kubernetes.io/managed-by: kustomize
+  name: orchestrator-sample
+spec:
+  eventName: test             # 이벤트 이름 → EventSource 이름은 자동으로 entered-event, endpoint는 /entered
+  namespace: user1                # 네임스페이스
+  eventType: webhook 
+  service: 
+    image: ghcr.io/knative/helloworld-go:latest

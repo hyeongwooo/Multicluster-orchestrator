@@ -1,0 +1,111 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: placementdecisions.orchestration.operator.io
+spec:
+  group: orchestration.operator.io
+  names:
+    kind: PlacementDecision
+    listKind: PlacementDecisionList
+    plural: placementdecisions
+    shortNames:
+    - pd
+    singular: placementdecision
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PlacementDecision is the Schema for the placementdecisions API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PlacementDecisionSpec defines the desired state of PlacementDecision.
+            properties:
+              preferred:
+                items:
+                  type: string
+                type: array
+            type: object
+          status:
+            description: PlacementDecisionStatus defines the observed state of PlacementDecision.
+            properties:
+              reason:
+                type: string
+              scores:
+                items:
+                  properties:
+                    cluster:
+                      type: string
+                    cpu:
+                      description: 0~1000 (0.000~1.000) 범위의 밀리 단위 점수
+                      format: int32
+                      maximum: 1000
+                      minimum: 0
+                      type: integer
+                    final:
+                      description: 최종 점수 (가중합 등), 동일 스케일
+                      format: int32
+                      maximum: 1000
+                      minimum: 0
+                      type: integer
+                    gpu:
+                      format: int32
+                      maximum: 1000
+                      minimum: 0
+                      type: integer
+                    latency:
+                      format: int32
+                      maximum: 1000
+                      minimum: 0
+                      type: integer
+                    mem:
+                      format: int32
+                      maximum: 1000
+                      minimum: 0
+                      type: integer
+                  required:
+                  - cluster
+                  - final
+                  type: object
+                type: array
+              selected:
+                items:
+                  properties:
+                    cluster:
+                      type: string
+                    replicas:
+                      format: int32
+                      type: integer
+                  required:
+                  - cluster
+                  type: object
+                type: array
+              updated:
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
