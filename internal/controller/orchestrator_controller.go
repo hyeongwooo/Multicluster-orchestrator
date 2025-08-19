@@ -138,6 +138,8 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePP(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName), "policy.karmada.io/v1alpha1", "OverridePolicy")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, "default", "argoproj.io/v1alpha1", "EventBus")
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, nameESNodePortSvc(orch.Spec.EventName), "v1", "Service") // 새 네이밍: <event>-eventsource-np
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, fmt.Sprintf("%s-es-np", orch.Name), "v1", "Service")     // 옛 네이밍: <orch.Name>-es-np (잔재 청소)
 
 		controllerutil.RemoveFinalizer(&orch, orchestratorFinalizer)
 		_ = r.Update(ctx, &orch)
@@ -226,9 +228,6 @@ func (r *OrchestratorReconciler) defaultSpec(o *orchestrationv1alpha1.Orchestrat
 	}
 	if o.Spec.EventType == "" {
 		o.Spec.EventType = "webhook"
-	}
-	if o.Spec.EventLogic == "" {
-		o.Spec.EventLogic = o.Spec.EventName
 	}
 	if o.Spec.EventSource == nil {
 		o.Spec.EventSource = &orchestrationv1alpha1.EventSourceSpec{}
@@ -512,37 +511,37 @@ func renderEventSource(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructu
 }
 
 func renderEventSourceNodePortService(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
-	if orch.Spec.EventSource.NodePort == 0 && !orch.Spec.Network.UseGlobalService {
-		return nil
+	// NodePort 노출 여부: NodePort 필드가 지정되었으면 생성
+	// (0 = 랜덤 할당, >0 = 고정 NodePort)
+	if orch.Spec.EventSource.Port == 0 {
+		return nil // 포트 자체가 없으면 만들 필요 없음
 	}
-	name := fmt.Sprintf("%s-es-np", orch.Name)
+
+	// EventSource NodePort Service의 표준 이름
+	name := nameESNodePortSvc(orch.Spec.EventName)
 	port := orch.Spec.EventSource.Port
+
+	// 공통 포트 정의
+	portMap := map[string]any{
+		"name":       "http",
+		"port":       port,
+		"targetPort": port,
+	}
+	if orch.Spec.EventSource.NodePort > 0 {
+		portMap["nodePort"] = orch.Spec.EventSource.NodePort
+	}
 
 	spec := map[string]any{
 		"type": string(corev1.ServiceTypeNodePort),
 		"selector": map[string]any{
 			"eventsource-name": nameES(orch.Spec.EventName),
 		},
-		"ports": []any{
-			map[string]any{
-				"name":       "http",
-				"port":       port,
-				"targetPort": port,
-			},
-		},
-	}
-	if orch.Spec.EventSource.NodePort > 0 {
-		spec["ports"].([]any)[0].(map[string]any)["nodePort"] = orch.Spec.EventSource.NodePort
+		"ports": []any{portMap},
 	}
 
 	md := map[string]any{
 		"name":      name,
 		"namespace": orch.Spec.Namespace,
-	}
-	if orch.Spec.Network.UseGlobalService && orch.Spec.Network.GlobalAnnotationKey != "" {
-		md["annotations"] = map[string]any{
-			orch.Spec.Network.GlobalAnnotationKey: orch.Spec.Network.GlobalAnnotationValue,
-		}
 	}
 
 	u := &uobj.Unstructured{}
@@ -596,8 +595,11 @@ func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, ksvcURL st
 }
 
 func renderSensor(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
+	// Consistent sensor name and cross-cluster propagation compatibility
+	sensorName := nameSN(orch.Spec.EventName)
 	wtName := nameWT(orch.Spec.EventName)
 
+	// Workflow object to be submitted by the Sensor (same as earlier working style)
 	wfObj := map[string]any{
 		"apiVersion": "argoproj.io/v1alpha1",
 		"kind":       "Workflow",
@@ -609,40 +611,52 @@ func renderSensor(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
 		},
 	}
 
+	// Dependencies: include eventSourceNamespace for clarity across clusters
+	dependencies := []any{
+		map[string]any{
+			"name":                 orch.Spec.EventName,
+			"eventSourceName":      nameES(orch.Spec.EventName),
+			"eventSourceNamespace": orch.Spec.Namespace,
+			"eventName":            orch.Spec.EventName,
+		},
+	}
+
+	// Trigger uses argoWorkflow submit to run the Workflow from the WorkflowTemplate
+	triggerTmpl := map[string]any{
+		"name": sensorName + "-trigger",
+		"argoWorkflow": map[string]any{
+			"operation": "submit",
+			"source":    map[string]any{"resource": wfObj},
+		},
+	}
+	// Add conditions only when user provided eventLogic in the CR
+	if orch.Spec.EventLogic != "" {
+		triggerTmpl["conditions"] = orch.Spec.EventLogic
+	} else {
+
+		triggerTmpl["conditions"] = nil
+	}
+
+	spec := map[string]any{
+		"template": map[string]any{
+			"eventBusName":       "default",
+			"serviceAccountName": "operate-workflow-sa",
+		},
+		"dependencies": dependencies,
+		"triggers": []any{
+			map[string]any{"template": triggerTmpl},
+		},
+	}
+
 	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
 		"apiVersion": "argoproj.io/v1alpha1",
 		"kind":       "Sensor",
 		"metadata": map[string]any{
-			"name":      nameSN(orch.Spec.EventName),
+			"name":      sensorName,
 			"namespace": orch.Spec.Namespace,
 		},
-		"spec": map[string]any{
-			"template": map[string]any{
-				"eventBusName":       "default",
-				"serviceAccountName": "operate-workflow-sa",
-			},
-			"dependencies": []any{
-				map[string]any{
-					"name":                 orch.Spec.EventName,
-					"eventSourceName":      nameES(orch.Spec.EventName),
-					"eventSourceNamespace": orch.Spec.Namespace,
-					"eventName":            orch.Spec.EventName,
-				},
-			},
-			"triggers": []any{
-				map[string]any{
-					"template": map[string]any{
-						"name":       fmt.Sprintf("%s-trigger", orch.Spec.EventName),
-						"conditions": orch.Spec.EventLogic,
-						"argoWorkflow": map[string]any{
-							"operation": "submit",
-							"source":    map[string]any{"resource": wfObj},
-						},
-					},
-				},
-			},
-		},
+		"spec": spec,
 	}
 	return u
 }
@@ -665,6 +679,8 @@ func renderPropagationPolicy(orch *orchestrationv1alpha1.Orchestrator, pd *orche
 				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "Sensor", "name": nameSN(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
 				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "WorkflowTemplate", "name": nameWT(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
 				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventSource", "name": nameES(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+				// NodePort Service for EventSource
+				map[string]any{"apiVersion": "v1", "kind": "Service", "name": nameESNodePortSvc(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
 				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventBus", "name": "default", "namespace": orch.Spec.Namespace},
 			},
 			"placement": map[string]any{
@@ -767,12 +783,14 @@ func toAnySlice(ss []string) []any {
 	return out
 }
 
+// ──────────────────────────────────────────────────────────────
 // 네이밍 규칙(일관 사용)
-func nameES(base string) string { return fmt.Sprintf("%s-event", base) }
-func nameSN(base string) string { return fmt.Sprintf("%s-sensor", base) }
-func nameWT(base string) string { return fmt.Sprintf("%s-wt", base) }
-func nameKS(base string) string { return fmt.Sprintf("%s-func", base) }
-func namePP(base string) string { return fmt.Sprintf("%s-pp", base) }
+func nameESNodePortSvc(event string) string { return fmt.Sprintf("%s-eventsource-np", event) }
+func nameES(base string) string             { return fmt.Sprintf("%s-event", base) }
+func nameSN(base string) string             { return fmt.Sprintf("%s-sensor", base) }
+func nameWT(base string) string             { return fmt.Sprintf("%s-wt", base) }
+func nameKS(base string) string             { return fmt.Sprintf("%s-func", base) }
+func namePP(base string) string             { return fmt.Sprintf("%s-pp", base) }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *OrchestratorReconciler) SetupWithManager(mgr ctrl.Manager) error {
