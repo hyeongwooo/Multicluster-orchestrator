@@ -1,5 +1,3 @@
-// internal/controller/orchestrator_controller.go
-
 /*
 Copyright 2025.
 
@@ -41,6 +39,26 @@ import (
 
 const fieldManager = "orchestrator"
 const orchestratorFinalizer = "orchestration.operator.io/finalizer"
+
+// ──────────────────────────────────────────────────────────────
+// Common label for all orchestrator-managed resources
+func applyCommonLabel(u *uobj.Unstructured, event string) {
+	if u == nil {
+		return
+	}
+	obj := u.Object
+	md, _ := obj["metadata"].(map[string]any)
+	if md == nil {
+		md = map[string]any{}
+		obj["metadata"] = md
+	}
+	labels, _ := md["labels"].(map[string]any)
+	if labels == nil {
+		labels = map[string]any{}
+		md["labels"] = labels
+	}
+	labels["orchestrator.operator.io/event"] = event
+}
 
 // ──────────────────────────────────────────────────────────────
 // Reconciler
@@ -296,6 +314,7 @@ func setOwner(orch *orchestrationv1alpha1.Orchestrator, o *uobj.Unstructured, sc
 
 func (r *OrchestratorReconciler) ensureKnativeServiceAndURL(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator, _ *orchestrationv1alpha1.PlacementDecision) (string, error) {
 	ksvc := renderKService(orch)
+	applyCommonLabel(ksvc, orch.Spec.EventName)
 	setOwner(orch, ksvc, r.Scheme)
 	if err := r.applyAll(ctx, []*uobj.Unstructured{ksvc}); err != nil {
 		return "", err
@@ -305,12 +324,14 @@ func (r *OrchestratorReconciler) ensureKnativeServiceAndURL(ctx context.Context,
 
 func (r *OrchestratorReconciler) ensureEventSourceNodePort(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator, _ *orchestrationv1alpha1.PlacementDecision) (int32, error) {
 	es := renderEventSource(orch)
+	applyCommonLabel(es, orch.Spec.EventName)
 	setOwner(orch, es, r.Scheme)
 	if err := r.applyAll(ctx, []*uobj.Unstructured{es}); err != nil {
 		return 0, err
 	}
 	svc := renderEventSourceNodePortService(orch)
 	if svc != nil {
+		applyCommonLabel(svc, orch.Spec.EventName)
 		setOwner(orch, svc, r.Scheme)
 		if err := r.applyAll(ctx, []*uobj.Unstructured{svc}); err != nil {
 			return 0, err
@@ -332,6 +353,8 @@ func (r *OrchestratorReconciler) renderBase(
 ) []*uobj.Unstructured {
 	wt := renderWorkflowTemplate(orch, ksvcURL)
 	sn := renderSensor(orch)
+	applyCommonLabel(wt, orch.Spec.EventName)
+	applyCommonLabel(sn, orch.Spec.EventName)
 	return []*uobj.Unstructured{wt, sn}
 }
 
@@ -341,11 +364,16 @@ func (r *OrchestratorReconciler) renderPolicies(
 ) []*uobj.Unstructured {
 	pp := renderPropagationPolicy(orch, pd)
 	domap, err := r.loadDomainMap(context.Background(), orch.Spec.Namespace)
-	if err != nil {
-		return []*uobj.Unstructured{pp}
+	var op *uobj.Unstructured
+	if err == nil {
+		op = renderOverridePolicyForWT(orch, pd, domap)
 	}
-	op := renderOverridePolicyForWT(orch, pd, domap)
-	return []*uobj.Unstructured{pp, op}
+	applyCommonLabel(pp, orch.Spec.EventName)
+	if op != nil {
+		applyCommonLabel(op, orch.Spec.EventName)
+		return []*uobj.Unstructured{pp, op}
+	}
+	return []*uobj.Unstructured{pp}
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -414,6 +442,7 @@ func (r *OrchestratorReconciler) fail(orch *orchestrationv1alpha1.Orchestrator, 
 
 func (r *OrchestratorReconciler) ensureManagedEventBus(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator) error {
 	eb := renderEventBusManaged(orch)
+	applyCommonLabel(eb, orch.Spec.EventName)
 	setOwner(orch, eb, r.Scheme)
 	return r.applyAll(ctx, []*uobj.Unstructured{eb})
 }

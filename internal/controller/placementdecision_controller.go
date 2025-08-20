@@ -74,11 +74,37 @@ type promAPIResponse struct {
 }
 
 const (
-	defaultHysteresisMargin int32         = 50 // 점수차 50 미만이면 이전 유지
-	defaultStickiness       time.Duration = 90 * time.Second
-	requeueWhenStable                     = 30 * time.Second
-	requeueWhenPending                    = 10 * time.Second
+	defaultHysteresisMargin int32         = 50               // 점수차 50 미만이면 이전 유지
+	defaultStickiness       time.Duration = 90 * time.Second // prefer previous for short window
 )
+
+// Helper functions for env-driven knobs
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return def
+}
+
+func envInt32(key string, def int32) int32 {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return int32(i)
+		}
+	}
+	return def
+}
 
 // read query result as float64 (returns NaN if missing)
 func queryInstant(ctx context.Context, baseURL, q string) float64 {
@@ -122,6 +148,12 @@ func strconvParseFloat(s string) (float64, error) {
 func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := crlog.FromContext(ctx)
 	log.Info("PD reconcile start", "namespacedName", req.NamespacedName)
+
+	// Requeue / policy knobs from env (optional overrides)
+	requeueWhenStable := envDuration("PD_REQUEUE_STABLE", 30*time.Second)
+	requeueWhenPending := envDuration("PD_REQUEUE_PENDING", 10*time.Second)
+	hysteresisMargin := envInt32("PD_HYSTERESIS_MARGIN", defaultHysteresisMargin)
+	stickiness := envDuration("PD_STICKINESS", defaultStickiness)
 
 	// 1) PD 로드
 	var pd orchestrationv1alpha1.PlacementDecision
@@ -174,6 +206,25 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			queries.gpu = strings.TrimSpace(cm.Data["gpu_query"])
 			queries.lat = strings.TrimSpace(cm.Data["latency_query"])
 		}
+	}
+	// Built-in query defaults when CM keys are empty
+	if strings.TrimSpace(queries.cpu) == "" {
+		queries.cpu = `avg(rate(node_cpu_seconds_total{mode!="idle", cluster="%s"}[2m]))`
+	}
+	if strings.TrimSpace(queries.mem) == "" {
+		queries.mem = `(1 - (node_memory_MemAvailable_bytes{cluster="%s"} / node_memory_MemTotal_bytes{cluster="%s"}))`
+	}
+	if strings.TrimSpace(queries.gpu) == "" {
+		queries.gpu = `avg(nvidia_gpu_utilization{cluster="%s"})`
+	}
+	if strings.TrimSpace(queries.lat) == "" {
+		queries.lat = `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{cluster="%s"}[5m])) by (le))`
+	}
+	queriesDump := map[string]string{
+		"cpu_query":     queries.cpu,
+		"mem_query":     queries.mem,
+		"gpu_query":     queries.gpu,
+		"latency_query": queries.lat,
 	}
 
 	// 6) 가중치 (없으면 1.0씩)
@@ -264,12 +315,12 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			best = c
 		}
 	}
-	margin := defaultHysteresisMargin
+	margin := hysteresisMargin
 	if prev != "" && best != prev {
 		if raws[best].Final < raws[prev].Final+margin {
 			best = prev
 		}
-		if prevAt != nil && time.Since(prevAt.Time) < defaultStickiness {
+		if prevAt != nil && time.Since(prevAt.Time) < stickiness {
 			best = prev
 		}
 	}
@@ -291,19 +342,27 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return out
 	}()
 
-	queriesDump := map[string]string{
-		"cpu_query":     queries.cpu,
-		"mem_query":     queries.mem,
-		"gpu_query":     queries.gpu,
-		"latency_query": queries.lat,
-	}
-
 	newSelected := []orchestrationv1alpha1.SelectedCluster{{Cluster: best}}
 	sameSel := (len(pd.Status.Selected) == 1 && pd.Status.Selected[0].Cluster == best)
 
-	if sameSel {
+	// Force reconcile annotation trigger
+	forceKey := "orchestration.operator.io/force-reconcile"
+	forceRequested := strings.TrimSpace(pd.Annotations[forceKey]) != ""
+
+	if sameSel && !forceRequested {
 		log.V(1).Info("stable selection", "selected", best, "final", raws[best].Final)
 		return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
+	}
+
+	// If force reconcile requested, remove the annotation to avoid busy-looping
+	if forceRequested {
+		if pd.Annotations == nil {
+			pd.Annotations = map[string]string{}
+		}
+		delete(pd.Annotations, forceKey)
+		if err := r.Update(ctx, &pd); err != nil {
+			log.Error(err, "failed to remove force-reconcile annotation")
+		}
 	}
 
 	now := metav1.Now()
