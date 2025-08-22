@@ -36,6 +36,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 
+	workv1alpha1 "github.com/karmada-io/api/work/v1alpha1"
+	"k8s.io/apimachinery/pkg/labels"
+
 	orchestrationv1alpha1 "github.com/wnguddn777/multicluster-orchestrator/api/v1alpha1"
 )
 
@@ -49,6 +52,24 @@ type PlacementDecisionReconciler struct {
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions/finalizers,verbs=update
+
+// firstRBTargetCluster returns a single cluster name from a ResourceBinding.
+// Prefer status.AggregatedStatus, fallback to spec.Clusters (first cluster name).
+func firstRBTargetCluster(rb *workv1alpha1.ResourceBinding) string {
+	// 1) Prefer status.AggregatedStatus
+	for _, st := range rb.Status.AggregatedStatus {
+		if st.ClusterName != "" {
+			return st.ClusterName
+		}
+	}
+	// 2) Fallback to spec.Clusters (first cluster name)
+	if len(rb.Spec.Clusters) > 0 {
+		if rb.Spec.Clusters[0].Name != "" {
+			return rb.Spec.Clusters[0].Name
+		}
+	}
+	return ""
+}
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -301,6 +322,45 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 		raws[c] = raw{CPU: cpuVal, Mem: memVal, GPU: gpuVal, Lat: latVal, Final: final}
 	}
+
+	// ──────────────────────────────────────────────────────────────
+	// EventBus home detection via ResourceBinding labels
+	eventLabel := pd.Labels["orchestrator.operator.io/event"]
+	if eventLabel != "" {
+		var rbList workv1alpha1.ResourceBindingList
+		sel := labels.SelectorFromSet(map[string]string{
+			"orchestrator.operator.io/event":     eventLabel,
+			"orchestrator.operator.io/component": "eventbus",
+		})
+		if err := r.List(ctx, &rbList, client.InNamespace(req.Namespace), &client.ListOptions{LabelSelector: sel}); err == nil {
+			if len(rbList.Items) > 0 {
+				ebHome := firstRBTargetCluster(&rbList.Items[0])
+				if ebHome != "" {
+					globalSvc := "nats-bus"
+					busURL := fmt.Sprintf("nats://%s.%s.svc.cluster.local:%d", globalSvc, req.Namespace, 4222)
+					natsSel := map[string]string{
+						"controller":    "eventbus-controller",
+						"eventbus-name": "default",
+					}
+					if pd.Status.EventInfra == nil || pd.Status.EventInfra.EventBusHome != ebHome || pd.Status.EventInfra.BusURL != busURL {
+						pd.Status.EventInfra = &orchestrationv1alpha1.EventInfraStatus{
+							EventBusHome:          ebHome,
+							GlobalNATSServiceName: globalSvc,
+							NatsBackendSelector:   natsSel,
+							BusURL:                busURL,
+						}
+						// best-effort partial status update; final Status().Update happens later too
+						if err := r.Status().Update(ctx, &pd); err != nil {
+							log.V(1).Error(err, "eventInfra status update failed (will retry)")
+						}
+					}
+				}
+			}
+		} else {
+			log.V(1).Error(err, "list ResourceBindings for eventbus failed")
+		}
+	}
+	// ──────────────────────────────────────────────────────────────
 
 	// 8) 베스트 선택 + 히스테리시스/스티키니스
 	prev := ""

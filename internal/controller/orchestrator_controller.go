@@ -40,6 +40,9 @@ import (
 const fieldManager = "orchestrator"
 const orchestratorFinalizer = "orchestration.operator.io/finalizer"
 
+// Pin annotation (manual test): orchestrator.operator.io/eswt-pinned: <clusterName>
+// Automation rule: if EventBusHome(from PD.Status.EventInfra) != ES/WT home, create Global NATS Service and Exotic EventBus(default-remote) in ES/WT cluster.
+
 // ──────────────────────────────────────────────────────────────
 // Common label for all orchestrator-managed resources
 func applyCommonLabel(u *uobj.Unstructured, event string) {
@@ -58,6 +61,32 @@ func applyCommonLabel(u *uobj.Unstructured, event string) {
 		md["labels"] = labels
 	}
 	labels["orchestrator.operator.io/event"] = event
+}
+
+// renderNatsGlobalService returns a Service named "nats-bus" with global annotation and empty selector.
+func renderNatsGlobalService(ns string) *uobj.Unstructured {
+	svc := &uobj.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Service",
+		"metadata": map[string]any{
+			"name":      "nats-bus",
+			"namespace": ns,
+			"annotations": map[string]any{
+				"service.cilium.io/global": "true",
+			},
+		},
+		"spec": map[string]any{
+			"type":     "ClusterIP",
+			"selector": map[string]any{},
+			"ports": []any{
+				map[string]any{"name": "client", "port": 4222, "targetPort": 4222},
+				map[string]any{"name": "cluster", "port": 6222, "targetPort": 6222},
+				map[string]any{"name": "metrics", "port": 7777, "targetPort": 7777},
+				map[string]any{"name": "monitor", "port": 8222, "targetPort": 8222},
+			},
+		},
+	}}
+	return svc
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -158,6 +187,11 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, "default", "argoproj.io/v1alpha1", "EventBus")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, nameESNodePortSvc(orch.Spec.EventName), "v1", "Service") // 새 네이밍: <event>-eventsource-np
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, fmt.Sprintf("%s-es-np", orch.Name), "v1", "Service")     // 옛 네이밍: <orch.Name>-es-np (잔재 청소)
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePPESWT(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePPOthers(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePPEBManaged(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePPEBRemote(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
+		_ = r.deleteChild(ctx, orch.Spec.Namespace, "default-remote", "argoproj.io/v1alpha1", "EventBus")
 
 		controllerutil.RemoveFinalizer(&orch, orchestratorFinalizer)
 		_ = r.Update(ctx, &orch)
@@ -196,6 +230,9 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		return r.fail(&orch, "EnsurePlacementFailed", err)
 	}
+	if pd.Status.EventInfra != nil {
+		log.V(1).Info("event infra detected", "busHome", pd.Status.EventInfra.EventBusHome, "busURL", pd.Status.EventInfra.BusURL)
+	}
 	if len(pd.Status.Selected) == 0 {
 		orch.Status.KsvcURL = ksvcURL
 		now := metav1.Now()
@@ -214,9 +251,41 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.fail(&orch, "ApplyPoliciesFailed", err)
 	}
 
-	// 3-1) Managed EventBus 보장 (spec.jetstream.version=latest)
-	if err := r.ensureManagedEventBus(ctx, &orch); err != nil {
-		return r.fail(&orch, "EnsureEventBusFailed", err)
+	// ES/WT 홈과 EB 홈 계산
+	eswt := ""
+	if len(pd.Status.Selected) > 0 {
+		eswt = pd.Status.Selected[0].Cluster
+	}
+	if orch.Annotations != nil {
+		if pin := strings.TrimSpace(orch.Annotations["orchestrator.operator.io/eswt-pinned"]); pin != "" {
+			eswt = pin
+		}
+	}
+	ebHome := eswt
+	busURL := ""
+	if pd.Status.EventInfra != nil {
+		if pd.Status.EventInfra.EventBusHome != "" {
+			ebHome = pd.Status.EventInfra.EventBusHome
+		}
+		busURL = pd.Status.EventInfra.BusURL
+	}
+
+	// EB가 원격인 경우에만 Global NATS SVC + Exotic EB 생성
+	if ebHome != "" && eswt != "" && ebHome != eswt {
+		natsSvc := renderNatsGlobalService(orch.Spec.Namespace)
+		applyCommonLabel(natsSvc, orch.Spec.EventName)
+		setOwner(&orch, natsSvc, r.Scheme)
+		if err := r.applyAll(ctx, []*uobj.Unstructured{natsSvc}); err != nil {
+			return r.fail(&orch, "ApplyGlobalNatsServiceFailed", err)
+		}
+		if busURL != "" {
+			ebRemote := renderEventBusExotic(&orch, busURL)
+			applyCommonLabel(ebRemote, orch.Spec.EventName)
+			setOwner(&orch, ebRemote, r.Scheme)
+			if err := r.applyAll(ctx, []*uobj.Unstructured{ebRemote}); err != nil {
+				return r.fail(&orch, "ApplyEventBusRemoteFailed", err)
+			}
+		}
 	}
 
 	// 4) Status 최종 업데이트
@@ -362,18 +431,198 @@ func (r *OrchestratorReconciler) renderPolicies(
 	orch *orchestrationv1alpha1.Orchestrator,
 	pd *orchestrationv1alpha1.PlacementDecision,
 ) []*uobj.Unstructured {
-	pp := renderPropagationPolicy(orch, pd)
-	domap, err := r.loadDomainMap(context.Background(), orch.Spec.Namespace)
-	var op *uobj.Unstructured
-	if err == nil {
-		op = renderOverridePolicyForWT(orch, pd, domap)
+	// Optional pin annotation to force ES/WT home cluster for manual tests
+	pin := ""
+	if orch.Annotations != nil {
+		pin = strings.TrimSpace(orch.Annotations["orchestrator.operator.io/eswt-pinned"])
 	}
-	applyCommonLabel(pp, orch.Spec.EventName)
-	if op != nil {
-		applyCommonLabel(op, orch.Spec.EventName)
-		return []*uobj.Unstructured{pp, op}
+
+	objs := []*uobj.Unstructured{}
+
+	// 1) ES/WT 전용 PP (핀 적용)
+	ppESWT := renderPropagationPolicyESWT(orch, pd, pin)
+	applyCommonLabel(ppESWT, orch.Spec.EventName)
+	objs = append(objs, ppESWT)
+
+	// 2) Others(KSvc/Sensor/ES NodePort) 전용 PP
+	ppOthers := renderPropagationPolicyOthers(orch, pd)
+	applyCommonLabel(ppOthers, orch.Spec.EventName)
+	objs = append(objs, ppOthers)
+
+	// 3) WT URL OverridePolicy (클러스터별 KSvc 엔드포인트)
+	if domap, err := r.loadDomainMap(context.Background(), orch.Spec.Namespace); err == nil {
+		if op := renderOverridePolicyForWT(orch, pd, domap); op != nil {
+			applyCommonLabel(op, orch.Spec.EventName)
+			objs = append(objs, op)
+		}
 	}
-	return []*uobj.Unstructured{pp}
+
+	// 4) EventBus 배치 정책: Managed(default) 는 EB 홈, Exotic(default-remote) 는 ESWT 홈(원격일 때만)
+	eswtClusters := extractClusters(pd.Status.Selected)
+	eswt := ""
+	if len(eswtClusters) > 0 {
+		eswt = eswtClusters[0]
+	}
+	if pin != "" {
+		eswt = pin
+	}
+
+	ebHome := eswt
+	if pd.Status.EventInfra != nil && pd.Status.EventInfra.EventBusHome != "" {
+		ebHome = pd.Status.EventInfra.EventBusHome
+	}
+
+	ppEBManaged := renderPropagationPolicyEventBusManaged(orch, ebHome)
+	applyCommonLabel(ppEBManaged, orch.Spec.EventName)
+	objs = append(objs, ppEBManaged)
+
+	if ebHome != "" && eswt != "" && ebHome != eswt {
+		ppEBRemote := renderPropagationPolicyEventBusRemote(orch, eswt)
+		applyCommonLabel(ppEBRemote, orch.Spec.EventName)
+		objs = append(objs, ppEBRemote)
+	}
+
+	return objs
+}
+
+// ES/WT 전용 PropagationPolicy (핀 주석이 있으면 해당 클러스터로 고정)
+func renderPropagationPolicyESWT(
+	orch *orchestrationv1alpha1.Orchestrator,
+	pd *orchestrationv1alpha1.PlacementDecision,
+	pin string,
+) *uobj.Unstructured {
+	name := namePPESWT(orch.Spec.EventName)
+	var selected []string
+	if pin != "" {
+		selected = []string{pin}
+	} else {
+		selected = extractClusters(pd.Status.Selected)
+	}
+
+	u := &uobj.Unstructured{}
+	u.Object = map[string]any{
+		"apiVersion": "policy.karmada.io/v1alpha1",
+		"kind":       "PropagationPolicy",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": orch.Spec.Namespace,
+		},
+		"spec": map[string]any{
+			"resourceSelectors": []any{
+				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "WorkflowTemplate", "name": nameWT(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventSource", "name": nameES(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+			},
+			"placement": map[string]any{
+				"clusterAffinity": map[string]any{
+					"clusterNames": toAnySlice(selected),
+				},
+			},
+		},
+	}
+	return u
+}
+
+// Others(KSvc/Sensor/ES NodePort) 전용 PropagationPolicy
+func renderPropagationPolicyOthers(
+	orch *orchestrationv1alpha1.Orchestrator,
+	pd *orchestrationv1alpha1.PlacementDecision,
+) *uobj.Unstructured {
+	name := namePPOthers(orch.Spec.EventName)
+	selected := extractClusters(pd.Status.Selected)
+
+	u := &uobj.Unstructured{}
+	u.Object = map[string]any{
+		"apiVersion": "policy.karmada.io/v1alpha1",
+		"kind":       "PropagationPolicy",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": orch.Spec.Namespace,
+		},
+		"spec": map[string]any{
+			"resourceSelectors": []any{
+				map[string]any{"apiVersion": "serving.knative.dev/v1", "kind": "Service", "name": nameKS(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "Sensor", "name": nameSN(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+				map[string]any{"apiVersion": "v1", "kind": "Service", "name": nameESNodePortSvc(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+			},
+			"placement": map[string]any{
+				"clusterAffinity": map[string]any{
+					"clusterNames": toAnySlice(selected),
+				},
+			},
+		},
+	}
+	return u
+}
+
+// Managed EventBus(default) -> only EB home cluster
+func renderPropagationPolicyEventBusManaged(orch *orchestrationv1alpha1.Orchestrator, ebHome string) *uobj.Unstructured {
+	u := &uobj.Unstructured{}
+	u.Object = map[string]any{
+		"apiVersion": "policy.karmada.io/v1alpha1",
+		"kind":       "PropagationPolicy",
+		"metadata": map[string]any{
+			"name":      namePPEBManaged(orch.Spec.EventName),
+			"namespace": orch.Spec.Namespace,
+		},
+		"spec": map[string]any{
+			"resourceSelectors": []any{
+				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventBus", "name": "default", "namespace": orch.Spec.Namespace},
+			},
+			"placement": map[string]any{
+				"clusterAffinity": map[string]any{
+					"clusterNames": toAnySlice([]string{ebHome}),
+				},
+			},
+		},
+	}
+	return u
+}
+
+// Remote EventBus(default-remote) -> only ES/WT home cluster when EB is remote
+func renderPropagationPolicyEventBusRemote(orch *orchestrationv1alpha1.Orchestrator, eswtCluster string) *uobj.Unstructured {
+	u := &uobj.Unstructured{}
+	u.Object = map[string]any{
+		"apiVersion": "policy.karmada.io/v1alpha1",
+		"kind":       "PropagationPolicy",
+		"metadata": map[string]any{
+			"name":      namePPEBRemote(orch.Spec.EventName),
+			"namespace": orch.Spec.Namespace,
+		},
+		"spec": map[string]any{
+			"resourceSelectors": []any{
+				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventBus", "name": "default-remote", "namespace": orch.Spec.Namespace},
+			},
+			"placement": map[string]any{
+				"clusterAffinity": map[string]any{
+					"clusterNames": toAnySlice([]string{eswtCluster}),
+				},
+			},
+		},
+	}
+	return u
+}
+
+// Exotic EventBus renderer
+func renderEventBusExotic(orch *orchestrationv1alpha1.Orchestrator, busURL string) *uobj.Unstructured {
+	u := &uobj.Unstructured{}
+	u.Object = map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "EventBus",
+		"metadata": map[string]any{
+			"name":      "default-remote",
+			"namespace": orch.Spec.Namespace,
+		},
+		"spec": map[string]any{
+			"jetstreamExotic": map[string]any{
+				"url": busURL,
+				"accessSecret": map[string]any{
+					"name": "nats-exotic-auth",
+					"key":  "auth.yaml",
+				},
+			},
+		},
+	}
+	return u
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -820,6 +1069,11 @@ func nameSN(base string) string             { return fmt.Sprintf("%s-sensor", ba
 func nameWT(base string) string             { return fmt.Sprintf("%s-wt", base) }
 func nameKS(base string) string             { return fmt.Sprintf("%s-func", base) }
 func namePP(base string) string             { return fmt.Sprintf("%s-pp", base) }
+
+func namePPESWT(base string) string      { return fmt.Sprintf("%s-pp-eswt", base) }
+func namePPOthers(base string) string    { return fmt.Sprintf("%s-pp-others", base) }
+func namePPEBManaged(base string) string { return fmt.Sprintf("%s-pp-eb-managed", base) }
+func namePPEBRemote(base string) string  { return fmt.Sprintf("%s-pp-eb-remote", base) }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *OrchestratorReconciler) SetupWithManager(mgr ctrl.Manager) error {
