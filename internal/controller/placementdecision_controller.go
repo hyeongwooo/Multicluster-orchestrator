@@ -1,19 +1,3 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
@@ -36,9 +20,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 
-	workv1alpha1 "github.com/karmada-io/api/work/v1alpha1"
-	"k8s.io/apimachinery/pkg/labels"
-
 	orchestrationv1alpha1 "github.com/wnguddn777/multicluster-orchestrator/api/v1alpha1"
 )
 
@@ -52,37 +33,10 @@ type PlacementDecisionReconciler struct {
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
-// firstRBTargetCluster returns a single cluster name from a ResourceBinding.
-// Prefer status.AggregatedStatus, fallback to spec.Clusters (first cluster name).
-func firstRBTargetCluster(rb *workv1alpha1.ResourceBinding) string {
-	// 1) Prefer status.AggregatedStatus
-	for _, st := range rb.Status.AggregatedStatus {
-		if st.ClusterName != "" {
-			return st.ClusterName
-		}
-	}
-	// 2) Fallback to spec.Clusters (first cluster name)
-	if len(rb.Spec.Clusters) > 0 {
-		if rb.Spec.Clusters[0].Name != "" {
-			return rb.Spec.Clusters[0].Name
-		}
-	}
-	return ""
-}
-
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the PlacementDecision object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
-// Prometheus API 응답 구조
-// Prometheus API response (instant query)
-// Prometheus API response (instant query)
+// ──────────────────────────────────────────────────────────────
+// Prometheus API response
 type promAPIResponse struct {
 	Status string `json:"status"`
 	Data   struct {
@@ -95,24 +49,21 @@ type promAPIResponse struct {
 }
 
 const (
-	defaultHysteresisMargin int32         = 50               // 점수차 50 미만이면 이전 유지
-	defaultStickiness       time.Duration = 90 * time.Second // prefer previous for short window
+	defaultHysteresisMargin int32         = 50
+	defaultStickiness       time.Duration = 90 * time.Second
+
+	// Health check defaults (for NATS monitoring endpoint)
+	defaultMonPath    = "/healthz"
+	defaultHTTPTO     = 2 * time.Second
+	defaultUseCluster = true
 )
 
-// Helper functions for env-driven knobs
+// ──────────────────────────────────────────────────────────────
+// env knobs
 func envDuration(key string, def time.Duration) time.Duration {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
-		}
-	}
-	return def
-}
-
-func envInt(key string, def int) int {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			return i
 		}
 	}
 	return def
@@ -127,7 +78,20 @@ func envInt32(key string, def int32) int32 {
 	return def
 }
 
-// read query result as float64 (returns NaN if missing)
+func envBool(key string, def bool) bool {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "t", "true", "y", "yes", "on":
+			return true
+		case "0", "f", "false", "n", "no", "off":
+			return false
+		}
+	}
+	return def
+}
+
+// ──────────────────────────────────────────────────────────────
+// prometheus instant query helpers
 func queryInstant(ctx context.Context, baseURL, q string) float64 {
 	if baseURL == "" || q == "" {
 		return math.NaN()
@@ -151,26 +115,172 @@ func queryInstant(ctx context.Context, baseURL, q string) float64 {
 		return math.NaN()
 	}
 	sv, _ := pr.Data.Result[0].Value[1].(string)
-	f, err := strconvParse(sv)
+	f, err := strconv.ParseFloat(strings.TrimSpace(sv), 64)
 	if err != nil {
 		return math.NaN()
 	}
 	return f
 }
 
-func strconvParse(s string) (float64, error) {
-	return strconvParseFloat(s)
+// ──────────────────────────────────────────────────────────────
+// scoring helpers
+type qset struct{ cpu, mem, gpu, lat string }
+
+func loadQueries(ctx context.Context, c client.Client, ns string) qset {
+	qs := qset{}
+	cm := &corev1.ConfigMap{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: "orchestrator-prom-queries"}, cm); err == nil {
+		qs.cpu = strings.TrimSpace(cm.Data["cpu_query"])
+		qs.mem = strings.TrimSpace(cm.Data["mem_query"])
+		qs.gpu = strings.TrimSpace(cm.Data["gpu_query"])
+		qs.lat = strings.TrimSpace(cm.Data["latency_query"])
+	}
+	// defaults
+	if qs.cpu == "" {
+		qs.cpu = `avg(rate(node_cpu_seconds_total{mode!="idle", cluster="%s"}[2m]))`
+	}
+	if qs.mem == "" {
+		qs.mem = `(1 - (node_memory_MemAvailable_bytes{cluster="%s"} / node_memory_MemTotal_bytes{cluster="%s"}))`
+	}
+	if qs.gpu == "" {
+		qs.gpu = `avg(nvidia_gpu_utilization{cluster="%s"})`
+	}
+	if qs.lat == "" {
+		qs.lat = `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{cluster="%s"}[5m])) by (le))`
+	}
+	return qs
 }
 
-func strconvParseFloat(s string) (float64, error) {
-	return strconv.ParseFloat(strings.TrimSpace(s), 64)
+type rawScore struct {
+	CPU, Mem, GPU, Lat float64
+	Final              int32
 }
 
+func norm01(x float64) float64 {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return 0.5
+	}
+	if x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
+}
+
+// ──────────────────────────────────────────────────────────────
+// owner Orchestrator helpers
+func loadOwnerOrchestrator(ctx context.Context, c client.Client, pd *orchestrationv1alpha1.PlacementDecision) (*orchestrationv1alpha1.Orchestrator, bool) {
+	var orch orchestrationv1alpha1.Orchestrator
+	for _, ow := range pd.OwnerReferences {
+		if ow.Kind == "Orchestrator" && strings.HasPrefix(ow.APIVersion, "orchestration.operator.io/") {
+			if err := c.Get(ctx, client.ObjectKey{Namespace: pd.Namespace, Name: ow.Name}, &orch); err == nil {
+				return &orch, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// candidates from spec + allowed/denied
+func deriveCandidates(orch *orchestrationv1alpha1.Orchestrator) []string {
+	allowed := append([]string{}, orch.Spec.Placement.AllowedClusters...)
+	if len(allowed) == 0 {
+		allowed = []string{"member1", "member2"}
+	}
+	denied := map[string]struct{}{}
+	for _, d := range orch.Spec.Placement.DeniedClusters {
+		denied[d] = struct{}{}
+	}
+	out := make([]string, 0, len(allowed))
+	for _, c := range allowed {
+		if _, bad := denied[c]; !bad {
+			out = append(out, c)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func weightsFromSpec(orch *orchestrationv1alpha1.Orchestrator) (wCPU, wMem, wGPU, wLat int) {
+	get := func(p *int32, def int) int {
+		if p == nil {
+			return def
+		}
+		if *p <= 0 {
+			return 0
+		}
+		return int(*p)
+	}
+	wCPU = get(orch.Spec.Placement.CPUWeight, 1)
+	wMem = get(orch.Spec.Placement.MemWeight, 1)
+	wGPU = get(orch.Spec.Placement.GPUWeight, 1)
+	wLat = get(orch.Spec.Placement.LatencyWeight, 1)
+	if wCPU+wMem+wGPU+wLat == 0 {
+		return 1, 1, 1, 1
+	}
+	return
+}
+
+// EB home policy: annotation → env → best(eswt)
+func decideEBHome(pd *orchestrationv1alpha1.PlacementDecision, best string) string {
+	if v := strings.TrimSpace(pd.Annotations["orchestrator.operator.io/eb-home"]); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("EB_HOME")); v != "" {
+		return v
+	}
+	return best
+}
+
+// buildBusURLs returns:
+// - client scheme (nats/tls)
+// - service FQDN (clusterset or cluster local)
+// - client BusURL (scheme://host:4222)
+// - monitor URL (http://host:8222/healthz) for health check
+func buildBusURLs(ns string) (scheme, svcFQDN, clientURL, monitorURL string) {
+	scheme = strings.TrimSpace(os.Getenv("PD_BUS_SCHEME"))
+	if scheme == "" {
+		scheme = "tls"
+	}
+	useClusterset := envBool("USE_CLUSTERSET_DNS", defaultUseCluster)
+	host := fmt.Sprintf("nats-bus.%s.svc.cluster.local", ns)
+	if useClusterset {
+		host = fmt.Sprintf("nats-bus.%s.svc.clusterset.local", ns)
+	}
+	clientURL = fmt.Sprintf("%s://%s:%d", scheme, host, 4222)
+
+	monPath := strings.TrimSpace(os.Getenv("PD_BUS_MON_PATH"))
+	if monPath == "" {
+		monPath = defaultMonPath
+	}
+	monitorURL = fmt.Sprintf("http://%s:%d%s", host, 8222, monPath)
+	svcFQDN = host
+	return
+}
+
+// Health check to NATS monitor endpoint (8222)
+func checkBusHealth(monitorURL string) bool {
+	if strings.TrimSpace(monitorURL) == "" {
+		return true
+	}
+	cl := &http.Client{Timeout: envDuration("PD_MON_HTTP_TIMEOUT", defaultHTTPTO)}
+	req, _ := http.NewRequest("GET", monitorURL, nil)
+	resp, err := cl.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+// ──────────────────────────────────────────────────────────────
+// Reconcile
 func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := crlog.FromContext(ctx)
 	log.Info("PD reconcile start", "namespacedName", req.NamespacedName)
 
-	// Requeue / policy knobs from env (optional overrides)
 	requeueWhenStable := envDuration("PD_REQUEUE_STABLE", 30*time.Second)
 	requeueWhenPending := envDuration("PD_REQUEUE_PENDING", 10*time.Second)
 	hysteresisMargin := envInt32("PD_HYSTERESIS_MARGIN", defaultHysteresisMargin)
@@ -185,87 +295,43 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, nil
 	}
 
-	// 2) Owner Orchestrator 찾기
-	var orch orchestrationv1alpha1.Orchestrator
-	foundOwner := false
-	for _, ow := range pd.OwnerReferences {
-		if ow.Kind == "Orchestrator" && strings.HasPrefix(ow.APIVersion, "orchestration.operator.io/") {
-			if err := r.Get(ctx, client.ObjectKey{Namespace: pd.Namespace, Name: ow.Name}, &orch); err == nil {
-				foundOwner = true
-				break
-			}
-		}
-	}
-	if !foundOwner {
+	// (옵션) 강제 재조정 플래그
+	forceKey := "orchestrator.operator.io/force-reconcile"
+	forced := strings.TrimSpace(pd.Annotations[forceKey]) != ""
+
+	// 2) Owner Orchestrator
+	orch, ok := loadOwnerOrchestrator(ctx, r.Client, &pd)
+	if !ok {
 		log.Info("no owner orchestrator; waiting owner")
 		return ctrl.Result{RequeueAfter: requeueWhenPending}, nil
 	}
 
 	// 3) 후보 클러스터
-	candidates := orch.Spec.Placement.AllowedClusters
+	candidates := deriveCandidates(orch)
 	if len(candidates) == 0 {
-		candidates = []string{"member1", "member2"}
+		log.Info("no candidates after filtering; waiting")
+		return ctrl.Result{RequeueAfter: requeueWhenPending}, nil
 	}
-	sort.Strings(candidates)
 
-	// 4) Prom URL 확정 (env 우선)
+	// Prom URL
 	if r.PromURL == "" {
 		if v := os.Getenv("PROM_URL"); v != "" {
 			r.PromURL = v
 		}
 	}
+	if r.PromURL == "" {
+		log.Info("PROM_URL not set; using neutral scoring (0.5 for all metrics)")
+	}
 	log.Info("scoring start", "promURL", r.PromURL, "candidates", candidates)
 
-	// 5) 쿼리 템플릿 로드 (옵션)
-	type qset struct{ cpu, mem, gpu, lat string }
-	var queries qset
-	{
-		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, client.ObjectKey{Namespace: pd.Namespace, Name: "orchestrator-prom-queries"}, cm); err == nil {
-			queries.cpu = strings.TrimSpace(cm.Data["cpu_query"])
-			queries.mem = strings.TrimSpace(cm.Data["mem_query"])
-			queries.gpu = strings.TrimSpace(cm.Data["gpu_query"])
-			queries.lat = strings.TrimSpace(cm.Data["latency_query"])
-		}
-	}
-	// Built-in query defaults when CM keys are empty
-	if strings.TrimSpace(queries.cpu) == "" {
-		queries.cpu = `avg(rate(node_cpu_seconds_total{mode!="idle", cluster="%s"}[2m]))`
-	}
-	if strings.TrimSpace(queries.mem) == "" {
-		queries.mem = `(1 - (node_memory_MemAvailable_bytes{cluster="%s"} / node_memory_MemTotal_bytes{cluster="%s"}))`
-	}
-	if strings.TrimSpace(queries.gpu) == "" {
-		queries.gpu = `avg(nvidia_gpu_utilization{cluster="%s"})`
-	}
-	if strings.TrimSpace(queries.lat) == "" {
-		queries.lat = `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{cluster="%s"}[5m])) by (le))`
-	}
-	queriesDump := map[string]string{
-		"cpu_query":     queries.cpu,
-		"mem_query":     queries.mem,
-		"gpu_query":     queries.gpu,
-		"latency_query": queries.lat,
-	}
+	// 5) 쿼리/가중치
+	queries := loadQueries(ctx, r.Client, pd.Namespace)
+	wCPU, wMem, wGPU, wLat := weightsFromSpec(orch)
 
-	// 6) 가중치 (없으면 1.0씩)
-	wCPU, wMem, wGPU, wLat := 1, 1, 1, 1
-
-	// 7) 점수 계산
-	type raw struct {
-		CPU, Mem, GPU, Lat float64
-		Final              int32
-	}
-	raws := make(map[string]raw, len(candidates))
-
+	// 6) 점수계산
+	raws := make(map[string]rawScore, len(candidates))
 	for _, c := range candidates {
-		var (
-			cpuVal = 1.0
-			memVal = 1.0
-			gpuVal = 1.0
-			latVal = 1.0
-		)
-		// Prometheus 조회 (있으면 사용)
+		cpuVal, memVal, gpuVal, latVal := 0.5, 0.5, 0.5, 0.5
 		if queries.cpu != "" {
 			q := fmt.Sprintf(queries.cpu, c)
 			if strings.Count(queries.cpu, "%s") == 2 {
@@ -297,95 +363,89 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			}
 		}
 
-		// 간단 정규화
-		norm := func(x float64) float64 {
-			if math.IsNaN(x) || math.IsInf(x, 0) {
-				return 0.5
-			}
-			if x < 0 {
-				return 0
-			}
-			if x > 1 {
-				return 1
-			}
-			return x
-		}
-		scoreCPU := 1 - norm(cpuVal) // 사용률 낮을수록 좋음
-		scoreMem := 1 - norm(memVal)
-		scoreGPU := 1 - norm(gpuVal)
-		scoreLat := 1 / (1 + latVal) // 지연 낮을수록 좋음
+		scoreCPU := 1 - norm01(cpuVal)
+		scoreMem := 1 - norm01(memVal)
+		scoreGPU := 1 - norm01(gpuVal)
+		scoreLat := 1 / (1 + math.Max(latVal, 0))
 
-		// ==== 여기 수정: wt 대신 wCPU/wMem/wGPU/wLat 사용 ====
 		num := float64(wCPU)*scoreCPU + float64(wMem)*scoreMem + float64(wGPU)*scoreGPU + float64(wLat)*scoreLat
 		den := float64(wCPU + wMem + wGPU + wLat)
 		final := int32(math.Round(1000.0 * num / den))
 
-		raws[c] = raw{CPU: cpuVal, Mem: memVal, GPU: gpuVal, Lat: latVal, Final: final}
+		raws[c] = rawScore{CPU: cpuVal, Mem: memVal, GPU: gpuVal, Lat: latVal, Final: final}
 	}
 
-	// ──────────────────────────────────────────────────────────────
-	// EventBus home detection via ResourceBinding labels
-	eventLabel := pd.Labels["orchestrator.operator.io/event"]
-	if eventLabel != "" {
-		var rbList workv1alpha1.ResourceBindingList
-		sel := labels.SelectorFromSet(map[string]string{
-			"orchestrator.operator.io/event":     eventLabel,
-			"orchestrator.operator.io/component": "eventbus",
-		})
-		if err := r.List(ctx, &rbList, client.InNamespace(req.Namespace), &client.ListOptions{LabelSelector: sel}); err == nil {
-			if len(rbList.Items) > 0 {
-				ebHome := firstRBTargetCluster(&rbList.Items[0])
-				if ebHome != "" {
-					globalSvc := "nats-bus"
-					busURL := fmt.Sprintf("nats://%s.%s.svc.cluster.local:%d", globalSvc, req.Namespace, 4222)
-					natsSel := map[string]string{
-						"controller":    "eventbus-controller",
-						"eventbus-name": "default",
-					}
-					if pd.Status.EventInfra == nil || pd.Status.EventInfra.EventBusHome != ebHome || pd.Status.EventInfra.BusURL != busURL {
-						pd.Status.EventInfra = &orchestrationv1alpha1.EventInfraStatus{
-							EventBusHome:          ebHome,
-							GlobalNATSServiceName: globalSvc,
-							NatsBackendSelector:   natsSel,
-							BusURL:                busURL,
-						}
-						// best-effort partial status update; final Status().Update happens later too
-						if err := r.Status().Update(ctx, &pd); err != nil {
-							log.V(1).Error(err, "eventInfra status update failed (will retry)")
-						}
-					}
-				}
-			}
-		} else {
-			log.V(1).Error(err, "list ResourceBindings for eventbus failed")
-		}
-	}
-	// ──────────────────────────────────────────────────────────────
-
-	// 8) 베스트 선택 + 히스테리시스/스티키니스
+	// 7) best + 히스테리시스/스티키니스
 	prev := ""
 	var prevAt *metav1.Time
 	if len(pd.Status.Selected) > 0 {
 		prev = pd.Status.Selected[0].Cluster
 		prevAt = pd.Status.Updated
 	}
+
+	// sort candidates by score desc
+	sort.SliceStable(candidates, func(i, j int) bool { return raws[candidates[i]].Final > raws[candidates[j]].Final })
 	best := candidates[0]
-	for _, c := range candidates {
-		if raws[c].Final > raws[best].Final {
-			best = c
-		}
-	}
-	margin := hysteresisMargin
-	if prev != "" && best != prev {
-		if raws[best].Final < raws[prev].Final+margin {
-			best = prev
-		}
-		if prevAt != nil && time.Since(prevAt.Time) < stickiness {
-			best = prev
+	if prev != "" {
+		// hysteresis & stickiness
+		if best != prev {
+			if raws[best].Final < raws[prev].Final+hysteresisMargin {
+				best = prev
+			}
+			if prevAt != nil && time.Since(prevAt.Time) < stickiness {
+				best = prev
+			}
 		}
 	}
 
-	// 9) Status 채우기
+	newSelected := []orchestrationv1alpha1.SelectedCluster{{Cluster: best}}
+	sameSel := (len(pd.Status.Selected) == 1 && pd.Status.Selected[0].Cluster == best)
+
+	// 8) EB 홈/BusURL/MonitorURL 결정 (PD가 권위자)
+	// 기본은 best를 허브로 본다.
+	home := decideEBHome(&pd, best)
+	_, svcFQDN, busURL, monitorURL := buildBusURLs(pd.Namespace)
+
+	// 허브(=home) 헬스체크 → 불건강하면 다음 후보로 EB 홈 전환
+	healthy := checkBusHealth(monitorURL)
+	if !healthy {
+		if len(candidates) > 1 {
+			for _, c := range candidates {
+				if c != best {
+					home = c
+					break
+				}
+			}
+		}
+		// clusterset DNS를 쓰면 URL은 동일, 실제 Endpoint만 엣지로 전환됨
+	}
+	ebHome := home
+
+	// 강제 재조정이면 주석 제거(1회성) 및 진행
+	if forced {
+		if pd.Annotations == nil {
+			pd.Annotations = map[string]string{}
+		}
+		delete(pd.Annotations, forceKey)
+		_ = r.Update(ctx, &pd)
+	}
+
+	// 9) stable이면 빠르게 리턴 (단, EventInfra가 바뀌었으면 갱신)
+	needsEvtInfraUpdate :=
+		pd.Status.EventInfra == nil ||
+			pd.Status.EventInfra.EventBusHome != ebHome ||
+			pd.Status.EventInfra.BusURL != busURL ||
+			pd.Status.EventInfra.GlobalNATSServiceName != "nats-bus"
+
+	if sameSel && !needsEvtInfraUpdate && !forced {
+		log.V(1).Info("stable selection",
+			"selected", best, "final", raws[best].Final,
+			"home", ebHome, "healthy", healthy)
+		return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
+	}
+
+	// 10) Status 갱신
+	now := metav1.Now()
 	toScores := func() []orchestrationv1alpha1.ClusterScore {
 		out := make([]orchestrationv1alpha1.ClusterScore, 0, len(candidates))
 		for _, c := range candidates {
@@ -402,44 +462,43 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return out
 	}()
 
-	newSelected := []orchestrationv1alpha1.SelectedCluster{{Cluster: best}}
-	sameSel := (len(pd.Status.Selected) == 1 && pd.Status.Selected[0].Cluster == best)
-
-	// Force reconcile annotation trigger
-	forceKey := "orchestration.operator.io/force-reconcile"
-	forceRequested := strings.TrimSpace(pd.Annotations[forceKey]) != ""
-
-	if sameSel && !forceRequested {
-		log.V(1).Info("stable selection", "selected", best, "final", raws[best].Final)
-		return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
-	}
-
-	// If force reconcile requested, remove the annotation to avoid busy-looping
-	if forceRequested {
-		if pd.Annotations == nil {
-			pd.Annotations = map[string]string{}
-		}
-		delete(pd.Annotations, forceKey)
-		if err := r.Update(ctx, &pd); err != nil {
-			log.Error(err, "failed to remove force-reconcile annotation")
-		}
-	}
-
-	now := metav1.Now()
 	pd.Status.Selected = newSelected
 	pd.Status.Scores = toScores
-	pd.Status.Reason = fmt.Sprintf("best=%s final=%d", best, raws[best].Final)
+	pd.Status.Reason = fmt.Sprintf("best=%s final=%d healthy=%v", best, raws[best].Final, healthy)
 	pd.Status.Updated = &now
-	// PlacementDebug 타입이 CRD에 정의되어 있어야 합니다.
 	pd.Status.Debug = &orchestrationv1alpha1.PlacementDebug{
 		PromURL: r.PromURL,
-		Queries: queriesDump,
+		Queries: map[string]string{
+			"cpu_query":     queries.cpu,
+			"mem_query":     queries.mem,
+			"gpu_query":     queries.gpu,
+			"latency_query": queries.lat,
+		},
+	}
+
+	// EventInfra 확정 (PD = 권위자)
+	pd.Status.EventInfra = &orchestrationv1alpha1.EventInfraStatus{
+		EventBusHome:          ebHome,     // 허브 or Failover된 엣지
+		GlobalNATSServiceName: "nats-bus", // Orchestrator에서 글로벌 SVC 이름으로 사용
+		NatsBackendSelector: map[string]string{
+			"controller":    "eventbus-controller",
+			"eventbus-name": "default",
+		},
+		BusURL: busURL, // e.g. tls://nats-bus.<ns>.svc.clusterset.local:4222
 	}
 
 	if err := r.Status().Update(ctx, &pd); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("PD selected", "selected", best, "final", raws[best].Final)
+	log.Info("PD updated",
+		"selected", best,
+		"final", raws[best].Final,
+		"ebHome", ebHome,
+		"busURL", busURL,
+		"monitorURL", monitorURL,
+		"globalSvc", svcFQDN,
+		"healthy", healthy,
+	)
 	return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
 }
 
@@ -450,7 +509,6 @@ func (r *PlacementDecisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			r.PromURL = v
 		}
 	}
-
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&orchestrationv1alpha1.PlacementDecision{}).
 		Named("placementdecision").

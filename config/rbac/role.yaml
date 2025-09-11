@@ -66,6 +66,7 @@ rules:
 - apiGroups:
   - policy.karmada.io
   resources:
+  - clusterpropagationpolicies
   - overridepolicies
   - propagationpolicies
   verbs:

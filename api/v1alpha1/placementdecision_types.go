@@ -72,9 +72,8 @@ type PlacementWeight struct {
 type PlacementDecisionSpec struct {
 	Preferred       []string        `json:"preferred,omitempty"`
 	AllowedClusters []string        `json:"allowedClusters,omitempty"`
-	Weights         PlacementWeight `json:"weights,omitempty"` 
+	Weights         PlacementWeight `json:"weights,omitempty"`
 }
-
 
 type PlacementDebug struct {
 	PromURL string            `json:"promURL,omitempty"`
