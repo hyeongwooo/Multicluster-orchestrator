@@ -35,11 +35,10 @@ type ClusterScore struct {
 	GPU int32 `json:"gpu,omitempty"`
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000
-	Lat int32 `json:"latency,omitempty"`
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1000
 	Final int32 `json:"final"`
 }
+
+
 
 type SelectedCluster struct {
 	Cluster  string `json:"cluster"`
@@ -57,15 +56,13 @@ type PlacementWeight struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000
 	GPU int32 `json:"gpu,omitempty"`
-	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=1000
-	Latency int32 `json:"latency,omitempty"`
-
 	// 선택 유지 히스테리시스 임계값 (점수 차이 이 값 미만이면 기존 선택 유지)
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000
 	Hysteresis int32 `json:"hysteresis,omitempty"`
 }
+
+
 
 // ---- Spec/Status ----
 
@@ -80,20 +77,12 @@ type PlacementDebug struct {
 	Queries map[string]string `json:"queries,omitempty"`
 }
 
-// ★ EventInfraStatus는 중첩 타입(리소스 아님). 절대 object:root 마커 넣지 않기!
-type EventInfraStatus struct {
-	EventBusHome          string            `json:"eventBusHome,omitempty"`
-	GlobalNATSServiceName string            `json:"globalNatsServiceName,omitempty"`
-	NatsBackendSelector   map[string]string `json:"natsBackendSelector,omitempty"`
-	BusURL                string            `json:"busURL,omitempty"`
-}
 
 type PlacementDecisionStatus struct {
 	Selected   []SelectedCluster `json:"selected,omitempty"`
 	Scores     []ClusterScore    `json:"scores,omitempty"`
 	Reason     string            `json:"reason,omitempty"`
 	Updated    *metav1.Time      `json:"updated,omitempty"`
-	EventInfra *EventInfraStatus `json:"eventInfra,omitempty"`
 	Debug      *PlacementDebug   `json:"debug,omitempty"`
 }
 

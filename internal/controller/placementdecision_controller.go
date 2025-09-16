@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,7 +24,8 @@ import (
 	orchestrationv1alpha1 "github.com/wnguddn777/multicluster-orchestrator/api/v1alpha1"
 )
 
-// PlacementDecisionReconciler reconciles a PlacementDecision object
+// ──────────────────────────────────────────────────────────────
+// Reconciler
 type PlacementDecisionReconciler struct {
 	client.Client
 	Scheme  *runtime.Scheme
@@ -52,7 +54,6 @@ const (
 	defaultHysteresisMargin int32         = 50
 	defaultStickiness       time.Duration = 90 * time.Second
 
-	// Health check defaults (for NATS monitoring endpoint)
 	defaultMonPath    = "/healthz"
 	defaultHTTPTO     = 2 * time.Second
 	defaultUseCluster = true
@@ -101,7 +102,8 @@ func queryInstant(ctx context.Context, baseURL, q string) float64 {
 	u := strings.TrimRight(baseURL, "/") + "/api/v1/query?" + qq.Encode()
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
-	resp, err := http.DefaultClient.Do(req)
+	httpClient := &http.Client{Timeout: envDuration("PD_PROM_HTTP_TIMEOUT", 3*time.Second)}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return math.NaN()
 	}
@@ -183,8 +185,18 @@ func loadOwnerOrchestrator(ctx context.Context, c client.Client, pd *orchestrati
 	return nil, false
 }
 
-// candidates from spec + allowed/denied
-func deriveCandidates(orch *orchestrationv1alpha1.Orchestrator) []string {
+// candidates: 우선순위 1) 도메인맵 키 2) spec.AllowedClusters 3) 기본값
+func deriveCandidates(ctx context.Context, c client.Client, orch *orchestrationv1alpha1.Orchestrator) []string {
+	// try domain map
+	if domap, err := loadDomainMap(ctx, c, orch.Spec.Namespace); err == nil && len(domap) > 0 {
+		out := make([]string, 0, len(domap))
+		for k := range domap {
+			out = append(out, k)
+		}
+		sort.Strings(out)
+		return out
+	}
+	// fallback: spec
 	allowed := append([]string{}, orch.Spec.Placement.AllowedClusters...)
 	if len(allowed) == 0 {
 		allowed = []string{"member1", "member2"}
@@ -194,15 +206,16 @@ func deriveCandidates(orch *orchestrationv1alpha1.Orchestrator) []string {
 		denied[d] = struct{}{}
 	}
 	out := make([]string, 0, len(allowed))
-	for _, c := range allowed {
-		if _, bad := denied[c]; !bad {
-			out = append(out, c)
+	for _, cName := range allowed {
+		if _, bad := denied[cName]; !bad {
+			out = append(out, cName)
 		}
 	}
 	sort.Strings(out)
 	return out
 }
 
+// weights
 func weightsFromSpec(orch *orchestrationv1alpha1.Orchestrator) (wCPU, wMem, wGPU, wLat int) {
 	get := func(p *int32, def int) int {
 		if p == nil {
@@ -234,16 +247,70 @@ func decideEBHome(pd *orchestrationv1alpha1.PlacementDecision, best string) stri
 	return best
 }
 
-// buildBusURLs returns:
-// - client scheme (nats/tls)
-// - service FQDN (clusterset or cluster local)
-// - client BusURL (scheme://host:4222)
-// - monitor URL (http://host:8222/healthz) for health check
-func buildBusURLs(ns string) (scheme, svcFQDN, clientURL, monitorURL string) {
-	scheme = strings.TrimSpace(os.Getenv("PD_BUS_SCHEME"))
-	if scheme == "" {
-		scheme = "tls"
+func loadDomainMap(ctx context.Context, c client.Client, ns string) (map[string]clusterEndpoint, error) {
+	cm := &corev1.ConfigMap{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: "orchestrator-domain-map"}, cm); err != nil {
+		return nil, err
 	}
+	tmp := map[string]struct {
+		ip   string
+		port *int32
+	}{}
+	for k, v := range cm.Data {
+		parts := strings.SplitN(k, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name, suffix := parts[0], parts[1]
+		ent := tmp[name]
+		switch suffix {
+		case "ip":
+			ent.ip = v
+		case "kourier":
+			if p, err := strconv.Atoi(v); err == nil {
+				pp := int32(p)
+				ent.port = &pp
+			}
+		}
+		tmp[name] = ent
+	}
+	out := map[string]clusterEndpoint{}
+	for name, ent := range tmp {
+		port := int32(31370) // fallback
+		if ent.port != nil {
+			port = *ent.port
+		}
+		out[name] = clusterEndpoint{IP: ent.ip, Port: port}
+	}
+	return out, nil
+}
+
+// buildBusURLs returns (scheme, hostFQDN, clientURL, monitorURL).
+// 우선순위:
+// 1) PD_BUS_NODEPORT=host:port 가 있으면 그걸 사용 (외부 노드포트 공개형 BYO)
+// 2) PD_BUS_HOST=host:port 가 있으면 그걸 사용
+// 3) clusterset 여부에 따라 nats-bus.<ns>.svc[.clusterset].local:4222
+func buildBusURLs(ns string) (scheme, hostFQDN, clientURL, monitorURL string) {
+	scheme = "tls"
+	if v := strings.TrimSpace(os.Getenv("PD_BUS_SCHEME")); v != "" {
+		scheme = v
+	}
+
+	if hp := strings.TrimSpace(os.Getenv("PD_BUS_NODEPORT")); hp != "" {
+		// host:port
+		hostFQDN = hp
+		clientURL = fmt.Sprintf("%s://%s", scheme, hostFQDN)
+		// 모니터는 http로 열렸다고 가정(포트는 노드포트가 다를 수 있으니 생략)
+		monitorURL = fmt.Sprintf("http://%s/healthz", hostFQDN)
+		return
+	}
+	if hp := strings.TrimSpace(os.Getenv("PD_BUS_HOST")); hp != "" {
+		hostFQDN = hp
+		clientURL = fmt.Sprintf("%s://%s", scheme, hostFQDN)
+		monitorURL = fmt.Sprintf("http://%s/healthz", hostFQDN)
+		return
+	}
+
 	useClusterset := envBool("USE_CLUSTERSET_DNS", defaultUseCluster)
 	host := fmt.Sprintf("nats-bus.%s.svc.cluster.local", ns)
 	if useClusterset {
@@ -256,17 +323,34 @@ func buildBusURLs(ns string) (scheme, svcFQDN, clientURL, monitorURL string) {
 		monPath = defaultMonPath
 	}
 	monitorURL = fmt.Sprintf("http://%s:%d%s", host, 8222, monPath)
-	svcFQDN = host
+	hostFQDN = host
 	return
 }
 
 // Health check to NATS monitor endpoint (8222)
+// jsz → healthz 폴백
 func checkBusHealth(monitorURL string) bool {
 	if strings.TrimSpace(monitorURL) == "" {
 		return true
 	}
 	cl := &http.Client{Timeout: envDuration("PD_MON_HTTP_TIMEOUT", defaultHTTPTO)}
-	req, _ := http.NewRequest("GET", monitorURL, nil)
+	// 1) jsz
+	u1 := strings.TrimSuffix(monitorURL, "/healthz")
+	if u1 != "" {
+		u1 = fmt.Sprintf("%s/jsz", strings.TrimRight(u1, "/"))
+	}
+	if ok := doHTTP200(cl, u1); ok {
+		return true
+	}
+	// 2) healthz
+	return doHTTP200(cl, monitorURL)
+}
+
+func doHTTP200(cl *http.Client, u string) bool {
+	if strings.TrimSpace(u) == "" {
+		return false
+	}
+	req, _ := http.NewRequest("GET", u, nil)
 	resp, err := cl.Do(req)
 	if err != nil {
 		return false
@@ -307,13 +391,13 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	// 3) 후보 클러스터
-	candidates := deriveCandidates(orch)
+	candidates := deriveCandidates(ctx, r.Client, orch)
 	if len(candidates) == 0 {
 		log.Info("no candidates after filtering; waiting")
 		return ctrl.Result{RequeueAfter: requeueWhenPending}, nil
 	}
 
-	// Prom URL
+	// 4) Prom URL
 	if r.PromURL == "" {
 		if v := os.Getenv("PROM_URL"); v != "" {
 			r.PromURL = v
@@ -322,7 +406,6 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if r.PromURL == "" {
 		log.Info("PROM_URL not set; using neutral scoring (0.5 for all metrics)")
 	}
-	log.Info("scoring start", "promURL", r.PromURL, "candidates", candidates)
 
 	// 5) 쿼리/가중치
 	queries := loadQueries(ctx, r.Client, pd.Namespace)
@@ -330,34 +413,34 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	// 6) 점수계산
 	raws := make(map[string]rawScore, len(candidates))
-	for _, c := range candidates {
+	for _, cName := range candidates {
 		cpuVal, memVal, gpuVal, latVal := 0.5, 0.5, 0.5, 0.5
 		if queries.cpu != "" {
-			q := fmt.Sprintf(queries.cpu, c)
+			q := fmt.Sprintf(queries.cpu, cName)
 			if strings.Count(queries.cpu, "%s") == 2 {
-				q = fmt.Sprintf(queries.cpu, c, c)
+				q = fmt.Sprintf(queries.cpu, cName, cName)
 			}
 			if v := queryInstant(ctx, r.PromURL, q); !math.IsNaN(v) {
 				cpuVal = v
 			}
 		}
 		if queries.mem != "" {
-			q := fmt.Sprintf(queries.mem, c)
+			q := fmt.Sprintf(queries.mem, cName)
 			if strings.Count(queries.mem, "%s") == 2 {
-				q = fmt.Sprintf(queries.mem, c, c)
+				q = fmt.Sprintf(queries.mem, cName, cName)
 			}
 			if v := queryInstant(ctx, r.PromURL, q); !math.IsNaN(v) {
 				memVal = v
 			}
 		}
 		if queries.gpu != "" {
-			q := fmt.Sprintf(queries.gpu, c)
+			q := fmt.Sprintf(queries.gpu, cName)
 			if v := queryInstant(ctx, r.PromURL, q); !math.IsNaN(v) {
 				gpuVal = v
 			}
 		}
 		if queries.lat != "" {
-			q := fmt.Sprintf(queries.lat, c)
+			q := fmt.Sprintf(queries.lat, cName)
 			if v := queryInstant(ctx, r.PromURL, q); !math.IsNaN(v) {
 				latVal = v
 			}
@@ -372,7 +455,7 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		den := float64(wCPU + wMem + wGPU + wLat)
 		final := int32(math.Round(1000.0 * num / den))
 
-		raws[c] = rawScore{CPU: cpuVal, Mem: memVal, GPU: gpuVal, Lat: latVal, Final: final}
+		raws[cName] = rawScore{CPU: cpuVal, Mem: memVal, GPU: gpuVal, Lat: latVal, Final: final}
 	}
 
 	// 7) best + 히스테리시스/스티키니스
@@ -383,11 +466,9 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		prevAt = pd.Status.Updated
 	}
 
-	// sort candidates by score desc
 	sort.SliceStable(candidates, func(i, j int) bool { return raws[candidates[i]].Final > raws[candidates[j]].Final })
 	best := candidates[0]
 	if prev != "" {
-		// hysteresis & stickiness
 		if best != prev {
 			if raws[best].Final < raws[prev].Final+hysteresisMargin {
 				best = prev
@@ -402,23 +483,21 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	sameSel := (len(pd.Status.Selected) == 1 && pd.Status.Selected[0].Cluster == best)
 
 	// 8) EB 홈/BusURL/MonitorURL 결정 (PD가 권위자)
-	// 기본은 best를 허브로 본다.
 	home := decideEBHome(&pd, best)
-	_, svcFQDN, busURL, monitorURL := buildBusURLs(pd.Namespace)
+	scheme, hostFQDN, busURL, monitorURL := buildBusURLs(pd.Namespace)
 
 	// 허브(=home) 헬스체크 → 불건강하면 다음 후보로 EB 홈 전환
 	healthy := checkBusHealth(monitorURL)
-	if !healthy {
-		if len(candidates) > 1 {
-			for _, c := range candidates {
-				if c != best {
-					home = c
-					break
-				}
+	if !healthy && len(candidates) > 1 {
+		for _, cName := range candidates {
+			if cName != best {
+				home = cName
+				break
 			}
 		}
-		// clusterset DNS를 쓰면 URL은 동일, 실제 Endpoint만 엣지로 전환됨
+		// clusterset DNS면 동일 URL로 라우팅이 바뀐다고 가정
 	}
+
 	ebHome := home
 
 	// 강제 재조정이면 주석 제거(1회성) 및 진행
@@ -440,7 +519,8 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if sameSel && !needsEvtInfraUpdate && !forced {
 		log.V(1).Info("stable selection",
 			"selected", best, "final", raws[best].Final,
-			"home", ebHome, "healthy", healthy)
+			"home", ebHome, "healthy", healthy,
+			"busURL", busURL, "host", hostFQDN, "scheme", scheme)
 		return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
 	}
 
@@ -448,10 +528,10 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	now := metav1.Now()
 	toScores := func() []orchestrationv1alpha1.ClusterScore {
 		out := make([]orchestrationv1alpha1.ClusterScore, 0, len(candidates))
-		for _, c := range candidates {
-			rv := raws[c]
+		for _, cName := range candidates {
+			rv := raws[cName]
 			out = append(out, orchestrationv1alpha1.ClusterScore{
-				Cluster: c,
+				Cluster: cName,
 				CPU:     int32(math.Round(rv.CPU * 1000)),
 				Mem:     int32(math.Round(rv.Mem * 1000)),
 				GPU:     int32(math.Round(rv.GPU * 1000)),
@@ -477,15 +557,16 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	// EventInfra 확정 (PD = 권위자)
-	pd.Status.EventInfra = &orchestrationv1alpha1.EventInfraStatus{
-		EventBusHome:          ebHome,     // 허브 or Failover된 엣지
-		GlobalNATSServiceName: "nats-bus", // Orchestrator에서 글로벌 SVC 이름으로 사용
-		NatsBackendSelector: map[string]string{
-			"controller":    "eventbus-controller",
-			"eventbus-name": "default",
-		},
-		BusURL: busURL, // e.g. tls://nats-bus.<ns>.svc.clusterset.local:4222
+	if pd.Status.EventInfra == nil {
+		pd.Status.EventInfra = &orchestrationv1alpha1.EventInfraStatus{}
 	}
+	pd.Status.EventInfra.EventBusHome = ebHome
+	pd.Status.EventInfra.GlobalNATSServiceName = "nats-bus"
+	pd.Status.EventInfra.NatsBackendSelector = map[string]string{
+		"controller":    "eventbus-controller",
+		"eventbus-name": "default",
+	}
+	pd.Status.EventInfra.BusURL = busURL
 
 	if err := r.Status().Update(ctx, &pd); err != nil {
 		return ctrl.Result{}, err
@@ -496,13 +577,14 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		"ebHome", ebHome,
 		"busURL", busURL,
 		"monitorURL", monitorURL,
-		"globalSvc", svcFQDN,
+		"host", hostFQDN,
 		"healthy", healthy,
 	)
 	return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// ──────────────────────────────────────────────────────────────
+// Setup
 func (r *PlacementDecisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.PromURL == "" {
 		if v := os.Getenv("PROM_URL"); v != "" {
@@ -513,4 +595,15 @@ func (r *PlacementDecisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&orchestrationv1alpha1.PlacementDecision{}).
 		Named("placementdecision").
 		Complete(r)
+}
+
+// ──────────────────────────────────────────────────────────────
+// 작은 유틸 (호스트:포맷 유효성 검사) — (옵션) 필요 시 사용
+func validHostPort(hp string) bool {
+	host, portStr, err := net.SplitHostPort(hp)
+	if err != nil || host == "" || portStr == "" {
+		return false
+	}
+	_, err = strconv.Atoi(portStr)
+	return err == nil
 }

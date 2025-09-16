@@ -73,9 +73,10 @@ type OrchestratorSpec struct {
 	// +kubebuilder:validation:Optional
 	EventSource *EventSourceSpec `json:"eventSource,omitempty"`
 
-	Service   ServiceSpec     `json:"service"` // Service.image는 필수 유지
-	Placement PlacementPolicy `json:"placementPolicy,omitempty"`
-	Network   NetworkSpec     `json:"network,omitempty"`
+	Service     ServiceSpec     `json:"service"` // Service.image는 필수 유지
+	Placement   PlacementPolicy `json:"placementPolicy,omitempty"`
+	Network     NetworkSpec     `json:"network,omitempty"`
+	EventBusRef string          `json:"eventBusRef,omitempty"`
 }
 
 // OrchestratorStatus defines the observed state of Orchestrator.

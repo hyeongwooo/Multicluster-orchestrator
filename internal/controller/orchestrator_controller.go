@@ -3,10 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"io"
 	"math/rand"
-	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -26,17 +23,8 @@ import (
 )
 
 const (
-
-	// 헬스체크용 ENV (사용자가 셋업)
-	// 예: http://nats-bus.<ns>.svc.clusterset.local:8222/healthz
 	fieldManager          = "orchestrator"
 	orchestratorFinalizer = "orchestration.operator.io/finalizer"
-	envNatsHubHealthURL   = "NATS_HUB_HEALTH_URL"
-	// 핀 복구/설정 쿨다운(초) – 너무 잦은 토글 방지
-	envFailoverCooldown = "FAILOVER_COOLDOWN"
-
-	// pin annotation key
-	annoPinESWT = "orchestrator.operator.io/eswt-pinned"
 )
 
 // ──────────────────────────────────────────────────────────────
@@ -81,6 +69,8 @@ type OrchestratorReconciler struct {
 
 // ──────────────────────────────────────────────────────────────
 // cluster → endpoint 매핑(ConfigMap: orchestrator-domain-map in spec.namespace)
+//   <cluster>.ip:       "192.168.10.x"
+//   <cluster>.kourier:  "31863" (NodePort)
 // ──────────────────────────────────────────────────────────────
 
 type clusterEndpoint struct {
@@ -202,33 +192,6 @@ func toAnySlice(ss []string) []any {
 	return out
 }
 
-// failover 쿨다운(기본 30초)
-func failoverCooldown() time.Duration {
-	if v := strings.TrimSpace(os.Getenv(envFailoverCooldown)); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
-	}
-	return 30 * time.Second
-}
-
-// 허브 헬스체크 (HTTP 200 기대)
-func checkHubHealthy(ctx context.Context) bool {
-	url := strings.TrimSpace(os.Getenv(envNatsHubHealthURL))
-	if url == "" {
-		// URL이 없으면 헬스체크를 패스(healthy로 간주) — 사용자 설정 필요
-		return true
-	}
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
-}
-
 // ──────────────────────────────────────────────────────────────
 // Reconcile
 // ──────────────────────────────────────────────────────────────
@@ -239,7 +202,7 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	log := crlog.FromContext(ctx)
-	log.Info("Reconciling Orchestrator(managed+failover)", "name", orch.Name, "namespace", orch.Namespace)
+	log.Info("Reconciling Orchestrator", "name", orch.Name, "namespace", orch.Namespace)
 
 	// Finalizer 보장 / 삭제 처리
 	if orch.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -259,7 +222,6 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName), "policy.karmada.io/v1alpha1", "OverridePolicy")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePPESWT(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePPOthers(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
-		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePPEBAll(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
 		_ = r.deleteChild(ctx, "", fmt.Sprintf("%s-cpp-ns-%s", orch.Spec.EventName, orch.Spec.Namespace), "policy.karmada.io/v1alpha1", "ClusterPropagationPolicy")
 
 		controllerutil.RemoveFinalizer(&orch, orchestratorFinalizer)
@@ -319,91 +281,18 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// 3) 장애 감지 & ES/WT 고정 핀 처리
-	// 허브/엣지 후보 계산
-	selected := extractClusters(pd.Status.Selected)
-	hub := "" // 기본 허브: 첫번째 선택
-	if len(selected) > 0 {
-		hub = selected[0]
-	}
-	edge := "" // 허브 외 첫번째
-	for _, c := range selected {
-		if c != hub {
-			edge = c
-			break
-		}
-	}
 
+	// 3) 대상 클러스터 계산 (PD 선택 결과 기반)
+	selected := extractClusters(pd.Status.Selected)
+
+	// 선택된(또는 도메인맵 기반 전체) 클러스터로 네임스페이스 전파
 	selectedAll := r.targetClustersForShared(ctx, &orch, pd)
 	cppNS := renderClusterPropagationPolicyNamespace(&orch, selectedAll)
 	if err := r.applyAll(ctx, []*uobj.Unstructured{cppNS}); err != nil {
 		return r.fail(&orch, "ApplyNamespaceCPPFailed", err)
 	}
 
-	// (3) EventBus 자체 생성 (관리 클러스터에 정의)
-	ebManaged := renderEventBusManaged(&orch)
-	applyCommonLabel(ebManaged, orch.Spec.EventName)
-	setOwner(&orch, ebManaged, r.Scheme)
-	if err := r.applyAll(ctx, []*uobj.Unstructured{ebManaged}); err != nil {
-		return r.fail(&orch, "ApplyEventBusManagedFailed", err)
-	}
-
-	// (4) EventBus 전파 PP - 네임스페이스 스코프 (OwnerRef OK)
-	ppEBAll := renderPropagationPolicyEventBusAll(&orch, selectedAll)
-	applyCommonLabel(ppEBAll, orch.Spec.EventName)
-	setOwner(&orch, ppEBAll, r.Scheme)
-	if err := r.applyAll(ctx, []*uobj.Unstructured{ppEBAll}); err != nil {
-		return r.fail(&orch, "ApplyEventBusPPAllFailed", err)
-	}
-
-	now := time.Now()
-	lastChange := orch.Status.LastPlacementTime
-	cooldown := failoverCooldown()
-
-	currentPin := ""
-	if orch.Annotations != nil {
-		currentPin = strings.TrimSpace(orch.Annotations[annoPinESWT])
-	}
-
-	hubHealthy := checkHubHealthy(ctx)
-
-	// 핀 토글은 쿨다운 고려
-	canToggle := true
-	if lastChange != nil && now.Sub(lastChange.Time) < cooldown {
-		canToggle = false
-	}
-
-	// 장애 → edge로 pin
-	if !hubHealthy && edge != "" && currentPin != edge && canToggle {
-		patch := orch.DeepCopy()
-		if patch.Annotations == nil {
-			patch.Annotations = map[string]string{}
-		}
-		patch.Annotations[annoPinESWT] = edge
-		if err := r.Patch(ctx, patch, client.MergeFrom(&orch)); err == nil {
-			t := metav1.Now()
-			orch.Status.LastPlacementTime = &t
-			_ = r.Status().Update(ctx, &orch)
-			log.Info("Failover pin set", "edge", edge)
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-	}
-
-	// 복구 → pin 해제
-	if hubHealthy && currentPin != "" && canToggle {
-		patch := orch.DeepCopy()
-		delete(patch.Annotations, annoPinESWT)
-		if err := r.Patch(ctx, patch, client.MergeFrom(&orch)); err == nil {
-			t := metav1.Now()
-			orch.Status.LastPlacementTime = &t
-			_ = r.Status().Update(ctx, &orch)
-			log.Info("Failback: pin cleared")
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-	}
-
-	// 4) 정책 생성
-	// ES/WT/Others 배치(핀 반영) + WT URL Override
+	// 4) 정책 생성 (ES/WT/Others + WT URL Override)
 	policyObjs := r.renderPoliciesESWTAndOthers(&orch, pd)
 	for _, o := range policyObjs {
 		setOwner(&orch, o, r.Scheme)
@@ -412,7 +301,7 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.fail(&orch, "ApplyPoliciesFailed", err)
 	}
 
-	// 6) 베이스(ksvc/wt/sensor) 생성/패치 – Sensor는 항상 eventBusName=default(Managed)
+	// 5) 베이스(ksvc/wt/sensor) 생성/패치 - 고정 EventBus("default") 사용
 	baseObjs := r.renderBase(&orch, ksvcURL, "default")
 	for _, o := range baseObjs {
 		setOwner(&orch, o, r.Scheme)
@@ -421,35 +310,26 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.fail(&orch, "ApplyBaseFailed", err)
 	}
 
-	// 7) Status 최종 업데이트
+	// 6) Status 최종 업데이트
 	orch.Status.KsvcURL = ksvcURL
 	orch.Status.SelectedClusters = selected
-	// 핀이 있으면 failover 활성화로 간주
-	pinned := ""
-	if orch.Annotations != nil {
-		pinned = strings.TrimSpace(orch.Annotations[annoPinESWT])
-	}
-	if pinned != "" {
-		r.setPhase(&orch, orchestrationv1alpha1.PhaseReady, fmt.Sprintf("Failover active (pinned to %s)", pinned))
+
+	// 간단한 Phase 계산
+	if !ready || ksvcURL == "" {
+		r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnKsvc, "Waiting for Knative URL")
+	} else if orch.Status.ESNodePort == 0 {
+		r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnNodePort, "Waiting for EventSource NodePort")
 	} else {
-		switch {
-		case !ready || ksvcURL == "":
-			r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnKsvc, "Waiting for Knative URL")
-		case orch.Status.ESNodePort == 0:
-			r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnNodePort, "Waiting for EventSource NodePort")
-		default:
-			r.setPhase(&orch, orchestrationv1alpha1.PhaseReady, "All resources applied")
-		}
+		r.setPhase(&orch, orchestrationv1alpha1.PhaseReady, "All resources applied")
 	}
 
 	if err := r.Status().Update(ctx, &orch); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	log.V(1).Info("reconciled orchestrator (managed+failover)",
+	log.V(1).Info("reconciled orchestrator",
 		"name", orch.Name, "ns", orch.Namespace,
-		"hubHealthy", hubHealthy,
-		"pinned", currentPin,
+		"selected", selected,
 	)
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
@@ -516,10 +396,8 @@ func (r *OrchestratorReconciler) setPhase(orch *orchestrationv1alpha1.Orchestrat
 	r.setCond(orch, "Ready", condFromPhase(phase), string(phase), msg)
 }
 
-// 모든 멤버로 전파가 필요한 리소스용: PD Candidates > 도메인맵 키 > Selected
 func (r *OrchestratorReconciler) targetClustersForShared(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator, pd *orchestrationv1alpha1.PlacementDecision) []string {
-
-	// 2) 도메인맵 키 전체 사용
+	// 1) 도메인맵이 있으면 키 전체 사용(전 클러스터 전파용)
 	if domap, err := r.loadDomainMap(ctx, orch.Spec.Namespace); err == nil && len(domap) > 0 {
 		out := make([]string, 0, len(domap))
 		for name := range domap {
@@ -527,8 +405,7 @@ func (r *OrchestratorReconciler) targetClustersForShared(ctx context.Context, or
 		}
 		return out
 	}
-
-	// 3) 최후의 수단: Selected
+	// 2) 없으면 Selected만
 	return extractClusters(pd.Status.Selected)
 }
 
@@ -771,7 +648,7 @@ func renderSensor(orch *orchestrationv1alpha1.Orchestrator, eventBusName string)
 
 	spec := map[string]any{
 		"template": map[string]any{
-			"eventBusName":       eventBusName, // "default" (managed)
+			"eventBusName":       eventBusName, // "default"
 			"serviceAccountName": "operate-workflow-sa",
 		},
 		"dependencies": dependencies,
@@ -792,6 +669,47 @@ func renderSensor(orch *orchestrationv1alpha1.Orchestrator, eventBusName string)
 }
 
 // ──────────────────────────────────────────────────────────────
+
+func renderClusterPropagationPolicyNamespace(
+	orch *orchestrationv1alpha1.Orchestrator,
+	clusterNames []string,
+) *uobj.Unstructured {
+	// This CPP ensures the target Namespace exists on all target clusters,
+	// so that namespaced resources (WT/Sensor/KSvc/ES) can be propagated cleanly.
+	name := fmt.Sprintf("%s-cpp-ns-%s", orch.Spec.EventName, orch.Spec.Namespace)
+
+	u := &uobj.Unstructured{}
+	u.SetAPIVersion("policy.karmada.io/v1alpha1")
+	u.SetKind("ClusterPropagationPolicy")
+	u.SetName(name)
+
+	u.Object = map[string]any{
+		"apiVersion": "policy.karmada.io/v1alpha1",
+		"kind":       "ClusterPropagationPolicy",
+		"metadata": map[string]any{
+			"name": name,
+			// Cluster-scoped, no namespace
+		},
+		"spec": map[string]any{
+			"resourceSelectors": []any{
+				map[string]any{
+					"apiVersion": "v1",
+					"kind":       "Namespace",
+					"name":       orch.Spec.Namespace,
+				},
+			},
+			"placement": map[string]any{
+				"clusterAffinity": map[string]any{
+					"clusterNames": toAnySlice(clusterNames),
+				},
+			},
+		},
+	}
+
+	return u
+}
+
+// ──────────────────────────────────────────────────────────────
 // Policies
 // ──────────────────────────────────────────────────────────────
 
@@ -800,26 +718,21 @@ func (r *OrchestratorReconciler) renderPoliciesESWTAndOthers(
 	orch *orchestrationv1alpha1.Orchestrator,
 	pd *orchestrationv1alpha1.PlacementDecision,
 ) []*uobj.Unstructured {
-	pin := ""
-	if orch.Annotations != nil {
-		pin = strings.TrimSpace(orch.Annotations[annoPinESWT])
-	}
-
 	objs := []*uobj.Unstructured{}
 
-	// ES/WT 전용 PP (핀 적용)
-	ppESWT := renderPropagationPolicyESWT(orch, pd, pin)
+	// ES/WT 전용 PP
+	ppESWT := renderPropagationPolicyESWT(orch, pd)
 	applyCommonLabel(ppESWT, orch.Spec.EventName)
 	objs = append(objs, ppESWT)
 
 	// Others(KSvc/Sensor/ES NodePort) 전용 PP
-	ppOthers := renderPropagationPolicyOthers(orch, pd, pin)
+	ppOthers := renderPropagationPolicyOthers(orch, pd)
 	applyCommonLabel(ppOthers, orch.Spec.EventName)
 	objs = append(objs, ppOthers)
 
-	// WT URL OverridePolicy
+	// WT URL OverridePolicy (도메인맵 기반)
 	if domap, err := r.loadDomainMap(context.Background(), orch.Spec.Namespace); err == nil {
-		if op := renderOverridePolicyForWT(orch, pd, domap, pin); op != nil {
+		if op := renderOverridePolicyForWT(orch, pd, domap); op != nil {
 			applyCommonLabel(op, orch.Spec.EventName)
 			objs = append(objs, op)
 		}
@@ -827,19 +740,13 @@ func (r *OrchestratorReconciler) renderPoliciesESWTAndOthers(
 	return objs
 }
 
-// ES/WT 전용 PropagationPolicy (핀 주석이 있으면 해당 클러스터로 고정)
+// ES/WT 전용 PropagationPolicy
 func renderPropagationPolicyESWT(
 	orch *orchestrationv1alpha1.Orchestrator,
 	pd *orchestrationv1alpha1.PlacementDecision,
-	pin string,
 ) *uobj.Unstructured {
 	name := namePPESWT(orch.Spec.EventName)
-	var selected []string
-	if pin != "" {
-		selected = []string{pin}
-	} else {
-		selected = extractClusters(pd.Status.Selected)
-	}
+	selected := extractClusters(pd.Status.Selected)
 
 	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
@@ -864,50 +771,13 @@ func renderPropagationPolicyESWT(
 	return u
 }
 
-func renderClusterPropagationPolicyNamespace(
-	orch *orchestrationv1alpha1.Orchestrator,
-	targetClusters []string,
-) *uobj.Unstructured {
-	u := &uobj.Unstructured{}
-	u.Object = map[string]any{
-		"apiVersion": "policy.karmada.io/v1alpha1",
-		"kind":       "ClusterPropagationPolicy",
-		"metadata": map[string]any{
-			// 클러스터 스코프이므로 고유 이름을 하나 정해줍니다.
-			"name": fmt.Sprintf("%s-cpp-ns-%s", orch.Spec.EventName, orch.Spec.Namespace),
-		},
-		"spec": map[string]any{
-			"resourceSelectors": []any{
-				map[string]any{
-					"apiVersion": "v1",
-					"kind":       "Namespace",
-					"name":       orch.Spec.Namespace,
-				},
-			},
-			"placement": map[string]any{
-				"clusterAffinity": map[string]any{
-					"clusterNames": toAnySlice(targetClusters),
-				},
-			},
-		},
-	}
-	return u
-}
-
-// Others(KSvc/Sensor/ES NodePort) 전용 PropagationPolicy (핀 적용)
+// Others(KSvc/Sensor/ES NodePort) 전용 PropagationPolicy
 func renderPropagationPolicyOthers(
 	orch *orchestrationv1alpha1.Orchestrator,
 	pd *orchestrationv1alpha1.PlacementDecision,
-	pin string,
 ) *uobj.Unstructured {
 	name := namePPOthers(orch.Spec.EventName)
-
-	var selected []string
-	if pin != "" {
-		selected = []string{pin}
-	} else {
-		selected = extractClusters(pd.Status.Selected)
-	}
+	selected := extractClusters(pd.Status.Selected)
 
 	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
@@ -933,62 +803,10 @@ func renderPropagationPolicyOthers(
 	return u
 }
 
-// Managed EventBus(default) – 제어plane에서 정의만(전파는 PP로)
-func renderEventBusManaged(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
-	u := &uobj.Unstructured{}
-	u.Object = map[string]any{
-		"apiVersion": "argoproj.io/v1alpha1",
-		"kind":       "EventBus",
-		"metadata": map[string]any{
-			"name":      "default",
-			"namespace": orch.Spec.Namespace,
-		},
-		"spec": map[string]any{
-			"jetstream": map[string]any{
-				"version": "latest",
-			},
-		},
-	}
-	return u
-}
-
-// EventBus(default) – 모든 선택 클러스터에 배포
-func renderPropagationPolicyEventBusAll(
-	orch *orchestrationv1alpha1.Orchestrator,
-	targetClusters []string,
-) *uobj.Unstructured {
-	u := &uobj.Unstructured{}
-	u.Object = map[string]any{
-		"apiVersion": "policy.karmada.io/v1alpha1",
-		"kind":       "PropagationPolicy",
-		"metadata": map[string]any{
-			"name":      namePPEBAll(orch.Spec.EventName),
-			"namespace": orch.Spec.Namespace,
-		},
-		"spec": map[string]any{
-			"resourceSelectors": []any{
-				map[string]any{
-					"apiVersion": "argoproj.io/v1alpha1",
-					"kind":       "EventBus",
-					"name":       "default",
-					"namespace":  orch.Spec.Namespace,
-				},
-			},
-			"placement": map[string]any{
-				"clusterAffinity": map[string]any{
-					"clusterNames": toAnySlice(targetClusters),
-				},
-			},
-		},
-	}
-	return u
-}
-
 func renderOverridePolicyForWT(
 	orch *orchestrationv1alpha1.Orchestrator,
 	pd *orchestrationv1alpha1.PlacementDecision,
 	domap map[string]clusterEndpoint,
-	pin string,
 ) *uobj.Unstructured {
 	u := &uobj.Unstructured{}
 	u.SetAPIVersion("policy.karmada.io/v1alpha1")
@@ -996,13 +814,7 @@ func renderOverridePolicyForWT(
 	u.SetName(fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName))
 	u.SetNamespace(orch.Spec.Namespace)
 
-	// ES/WT가 배치되는 집합(핀 반영)
-	var selected []string
-	if pin != "" {
-		selected = []string{pin}
-	} else {
-		selected = extractClusters(pd.Status.Selected)
-	}
+	selected := extractClusters(pd.Status.Selected)
 
 	rules := []any{}
 	for _, c := range selected {
@@ -1055,7 +867,6 @@ func renderOverridePolicyForWT(
 // Ksvc / NodePort
 // ──────────────────────────────────────────────────────────────
 
-// --- [ADD] EventSource + NodePort 보장 메서드 ---
 func (r *OrchestratorReconciler) ensureEventSourceNodePort(
 	ctx context.Context,
 	orch *orchestrationv1alpha1.Orchestrator,
@@ -1082,7 +893,6 @@ func (r *OrchestratorReconciler) ensureEventSourceNodePort(
 	return 0, nil
 }
 
-// --- [ADD] NodePort 읽기 메서드 ---
 func (r *OrchestratorReconciler) readEventSourceNodePort(
 	ctx context.Context,
 	orch *orchestrationv1alpha1.Orchestrator,
@@ -1100,7 +910,7 @@ func (r *OrchestratorReconciler) readEventSourceNodePort(
 	return svc.Spec.Ports[0].NodePort, nil
 }
 
-// --- [ADD] 베이스 리소스 렌더러 (WT + Sensor) ---
+// --- 베이스 리소스 렌더러 (WT + Sensor) ---
 func (r *OrchestratorReconciler) renderBase(
 	orch *orchestrationv1alpha1.Orchestrator,
 	ksvcURL string,
@@ -1155,10 +965,9 @@ func namePP(base string) string             { return fmt.Sprintf("%s-pp", base) 
 
 func namePPESWT(base string) string   { return fmt.Sprintf("%s-pp-eswt", base) }
 func namePPOthers(base string) string { return fmt.Sprintf("%s-pp-others", base) }
-func namePPEBAll(base string) string  { return fmt.Sprintf("%s-pp-eb-all", base) }
+func namePPEBEdge(base string) string { return fmt.Sprintf("%s-pp-eb-edge", base) } // 남겨두어도 미사용
 
 // SetupWithManager sets up the controller with the Manager.
-// SetupWithManager
 func (r *OrchestratorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&orchestrationv1alpha1.Orchestrator{}).

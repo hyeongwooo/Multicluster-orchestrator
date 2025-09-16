@@ -51,6 +51,8 @@ spec:
           spec:
             description: OrchestratorSpec defines the desired state of Orchestrator.
             properties:
+              eventBusRef:
+                type: string
               eventLogic:
                 description: 옵션(컨트롤러에서 기본값 주입)
                 type: string

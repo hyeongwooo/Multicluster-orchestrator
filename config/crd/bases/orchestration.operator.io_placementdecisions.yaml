@@ -66,11 +66,6 @@ spec:
                     maximum: 1000
                     minimum: 0
                     type: integer
-                  latency:
-                    format: int32
-                    maximum: 1000
-                    minimum: 0
-                    type: integer
                   mem:
                     format: int32
                     maximum: 1000
@@ -85,21 +80,6 @@ spec:
                   promURL:
                     type: string
                   queries:
-                    additionalProperties:
-                      type: string
-                    type: object
-                type: object
-              eventInfra:
-                description: ★ EventInfraStatus는 중첩 타입(리소스 아님). 절대 object:root 마커
-                  넣지 않기!
-                properties:
-                  busURL:
-                    type: string
-                  eventBusHome:
-                    type: string
-                  globalNatsServiceName:
-                    type: string
-                  natsBackendSelector:
                     additionalProperties:
                       type: string
                     type: object
@@ -122,11 +102,6 @@ spec:
                       minimum: 0
                       type: integer
                     gpu:
-                      format: int32
-                      maximum: 1000
-                      minimum: 0
-                      type: integer
-                    latency:
                       format: int32
                       maximum: 1000
                       minimum: 0
