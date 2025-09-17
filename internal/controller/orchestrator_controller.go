@@ -338,6 +338,22 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if len(selected) > 0 {
 		primary = []string{selected[0]}
 	}
+
+	svcURL := map[string]string{}
+	if len(primary) > 0 {
+		if domap, err := r.loadDomainMap(ctx, orch.Spec.Namespace); err == nil {
+			if ep, ok := domap[primary[0]]; ok && ep.IP != "" {
+				for _, s := range orch.Spec.Services {
+					host := fmt.Sprintf("%s.%s.%s.nip.io", s.Name, orch.Spec.Namespace, ep.IP)
+					if ep.Port > 0 {
+						svcURL[s.Name] = fmt.Sprintf("http://%s:%d", host, ep.Port)
+					} else {
+						svcURL[s.Name] = fmt.Sprintf("http://%s", host)
+					}
+				}
+			}
+		}
+	}
 	// 4) 정책 생성
 	//    - PrimaryOnly: WT/Sensor + EventSource/NodePort (항상 primary)
 	//    - KSvc: 현재는 primary 에만 배포하도록 제한 (svcTargets = primary)
@@ -351,7 +367,7 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// 5) 베이스(ksvc/wt/sensor) 생성/패치 - 고정 EventBus("default") 사용
-	baseObjs := r.renderBase(&orch, "default")
+	baseObjs := r.renderBase(&orch, "default", svcURL)
 	for _, o := range baseObjs {
 		setOwner(&orch, o, r.Scheme)
 	}
@@ -642,7 +658,17 @@ func renderEventSourceNodePortService(orch *orchestrationv1alpha1.Orchestrator) 
 	return u
 }
 
-func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
+func serviceURLFor(svcName string, orch *orchestrationv1alpha1.Orchestrator, svcURL map[string]string) string {
+	if svcURL != nil {
+		if v, ok := svcURL[svcName]; ok && strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	// fallback: cluster-local
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local", svcName, orch.Spec.Namespace)
+}
+
+func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, svcURL map[string]string) *uobj.Unstructured {
 	name := nameWT(orch.Spec.EventName)
 
 	stepsNested := []any{}
@@ -662,10 +688,13 @@ func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unst
 	}
 
 	for _, svc := range orch.Spec.Services {
+		baseURL := serviceURLFor(svc.Name, orch, svcURL)
+		path := "/" + svc.Name
+		finalURL := strings.TrimRight(baseURL, "/") + path
 		tmpl := map[string]any{
 			"name": svc.Name,
 			"http": map[string]any{
-				"url":    fmt.Sprintf("http://%s.%s.svc.cluster.local", svc.Name, orch.Spec.Namespace),
+				"url":    finalURL,
 				"method": "POST",
 				"headers": []any{
 					map[string]any{"name": "Content-Type", "value": "application/json"},
@@ -799,13 +828,6 @@ func (r *OrchestratorReconciler) renderPoliciesSplit(
 	applyCommonLabel(ppMulti, orch.Spec.EventName)
 	objs = append(objs, ppMulti)
 
-	// WT URL override -> primary only (nip.io per-cluster)
-	if domap, err := r.loadDomainMap(context.Background(), orch.Spec.Namespace); err == nil {
-		if op := renderOverridePolicyForWTPrimaryOnly(orch, primary, domap); op != nil {
-			applyCommonLabel(op, orch.Spec.EventName)
-			objs = append(objs, op)
-		}
-	}
 	return objs
 }
 
@@ -885,45 +907,6 @@ func renderPropagationPolicyMulti(
 	return u
 }
 
-// WT URL Override (primary only)
-func renderOverridePolicyForWTPrimaryOnly(
-	orch *orchestrationv1alpha1.Orchestrator,
-	primary []string,
-	domap map[string]clusterEndpoint,
-) *uobj.Unstructured {
-	if len(primary) == 0 {
-		return nil
-	}
-	name := fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName)
-	rules := []any{}
-	for _, c := range primary {
-		ep, ok := domap[c]
-		if !ok || ep.IP == "" || ep.Port == 0 {
-			continue
-		}
-		finalURL := fmt.Sprintf("http://%s.%s.%s.nip.io:%d", nameKS(orch.Spec.EventName), orch.Spec.Namespace, ep.IP, ep.Port)
-		rules = append(rules, map[string]any{
-			"targetCluster": map[string]any{"clusterNames": []any{c}},
-			"overriders": map[string]any{"plaintext": []any{map[string]any{
-				"path": "/spec/templates/1/http/url", "operator": "replace", "value": finalURL,
-			}}},
-		})
-	}
-	u := &uobj.Unstructured{}
-	u.Object = map[string]any{
-		"apiVersion": "policy.karmada.io/v1alpha1",
-		"kind":       "OverridePolicy",
-		"metadata":   map[string]any{"name": name, "namespace": orch.Spec.Namespace},
-		"spec": map[string]any{
-			"resourceSelectors": []any{map[string]any{
-				"apiVersion": "argoproj.io/v1alpha1", "kind": "WorkflowTemplate", "name": nameWT(orch.Spec.EventName), "namespace": orch.Spec.Namespace,
-			}},
-			"overrideRules": rules,
-		},
-	}
-	return u
-}
-
 // ──────────────────────────────────────────────────────────────
 // Ksvc / NodePort
 // ──────────────────────────────────────────────────────────────
@@ -984,8 +967,9 @@ func (r *OrchestratorReconciler) readEventSourceNodePort(
 func (r *OrchestratorReconciler) renderBase(
 	orch *orchestrationv1alpha1.Orchestrator,
 	eventBusName string,
+	svcURL map[string]string,
 ) []*uobj.Unstructured {
-	wt := renderWorkflowTemplate(orch)
+	wt := renderWorkflowTemplate(orch, svcURL)
 
 	var sn *uobj.Unstructured
 	if len(orch.Spec.EventSources) > 0 {
