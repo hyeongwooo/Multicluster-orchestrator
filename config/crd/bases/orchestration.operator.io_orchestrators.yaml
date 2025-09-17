@@ -51,18 +51,19 @@ spec:
           spec:
             description: OrchestratorSpec defines the desired state of Orchestrator.
             properties:
-              eventBusRef:
-                type: string
               eventLogic:
-                description: 옵션(컨트롤러에서 기본값 주입)
+                description: Optional high-level condition expression for sensor (e.g.,
+                  "A || B").
                 type: string
               eventName:
                 type: string
               eventSource:
-                description: |-
-                  옵션(컨트롤러에서 기본값 주입)
-                  객체 필드는 pointer 로 두면 완전히 생략 가능
+                description: 객체 필드는 pointer 로 두면 완전히 생략 가능
                 properties:
+                  name:
+                    description: minimal info; controller renders full EventSource
+                      CR
+                    type: string
                   nodePort:
                     format: int32
                     type: integer
@@ -75,25 +76,44 @@ spec:
                     format: int32
                     type: integer
                   type:
-                    description: minimal info; controller renders full EventSource
-                      CR
+                    default: webhook
                     type: string
+                required:
+                - name
                 type: object
+              eventSources:
+                items:
+                  description: |-
+                    EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
+                    NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+                  properties:
+                    name:
+                      description: minimal info; controller renders full EventSource
+                        CR
+                      type: string
+                    nodePort:
+                      format: int32
+                      type: integer
+                    params:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    port:
+                      description: Prefer fixed NodePort to avoid read-after-write
+                      format: int32
+                      type: integer
+                    type:
+                      default: webhook
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               eventType:
                 default: webhook
-                description: 기본값을 주고 싶으면 default 태그 추가
                 type: string
               namespace:
                 type: string
-              network:
-                properties:
-                  globalAnnotationKey:
-                    type: string
-                  globalAnnotationValue:
-                    type: string
-                  useGlobalService:
-                    type: boolean
-                type: object
               placementPolicy:
                 properties:
                   allowedClusters:
@@ -121,7 +141,27 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              sensor:
+                description: SensorSpec defines a simplified DSL for sensors (optional;
+                  controller can derive defaults).
+                properties:
+                  dependsOn:
+                    items:
+                      type: string
+                    type: array
+                  logic:
+                    type: string
+                  name:
+                    type: string
+                  workflowTemplateName:
+                    type: string
+                required:
+                - name
+                - workflowTemplateName
+                type: object
               service:
+                description: 'Deprecated: prefer `services` when you need multiple
+                  kservices.'
                 properties:
                   concurrencyTarget:
                     format: int32
@@ -136,21 +176,45 @@ spec:
                     type: object
                   image:
                     type: string
+                  name:
+                    description: ServiceSpec can be used in a list of services.
+                    type: string
                 required:
                 - image
                 type: object
+              services:
+                description: |-
+                  One or more Knative Services. When set, the controller should prefer this field.
+                  If empty, fallback to single Service for backward-compat.
+                items:
+                  description: ServiceSpec describes a single Knative Service to be
+                    created.
+                  properties:
+                    concurrencyTarget:
+                      format: int32
+                      type: integer
+                    domainSuffix:
+                      description: 'Optional: if you want to compute URL instead of
+                        reading status'
+                      type: string
+                    env:
+                      additionalProperties:
+                        type: string
+                      type: object
+                    image:
+                      type: string
+                    name:
+                      description: ServiceSpec can be used in a list of services.
+                      type: string
+                  required:
+                  - image
+                  type: object
+                type: array
             required:
             - eventName
-            - service
             type: object
           status:
-            description: Orchestrator status는 controller가 채움
-            enum:
-            - Pending
-            - WaitingOnKsvc
-            - WaitingOnNodePort
-            - Ready
-            - Error
+            description: OrchestratorStatus holds runtime status fields.
             properties:
               conditions:
                 items:

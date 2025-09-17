@@ -23,7 +23,10 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 type EventSourceSpec struct {
+	// +kubebuilder:validation:Required
 	// minimal info; controller renders full EventSource CR
+	Name string `json:"name"`
+	// +kubebuilder:default=webhook
 	Type   string            `json:"type,omitempty"`   // e.g., "webhook"
 	Params map[string]string `json:"params,omitempty"` // endpoint, method, path, etc
 	// Prefer fixed NodePort to avoid read-after-write
@@ -31,12 +34,23 @@ type EventSourceSpec struct {
 	NodePort int32 `json:"nodePort,omitempty"`
 }
 
+// ServiceSpec describes a single Knative Service to be created.
 type ServiceSpec struct {
+	// ServiceSpec can be used in a list of services.
+	Name              string            `json:"name,omitempty"` // optional logical name (needed when using multiple services)
 	Image             string            `json:"image"`
 	ConcurrencyTarget *int32            `json:"concurrencyTarget,omitempty"`
 	Env               map[string]string `json:"env,omitempty"`
 	// Optional: if you want to compute URL instead of reading status
 	DomainSuffix string `json:"domainSuffix,omitempty"` // e.g., "example.com" or nip.io base
+}
+
+// SensorSpec defines a simplified DSL for sensors (optional; controller can derive defaults).
+type SensorSpec struct {
+	Name      string   `json:"name"`                 // sensor 이름
+	DependsOn []string `json:"dependsOn,omitempty"`  // 의존하는 이벤트소스들
+	Logic     string   `json:"logic,omitempty"`      // 조건식 (ex: "A || B")
+	Workflow  string   `json:"workflowTemplateName"` // 트리거할 WorkflowTemplate 이름
 }
 
 type PlacementPolicy struct {
@@ -50,33 +64,36 @@ type PlacementPolicy struct {
 	LatencyWeight *int32 `json:"latencyWeight,omitempty"`
 }
 
-type NetworkSpec struct {
-	UseGlobalService      bool   `json:"useGlobalService,omitempty"`
-	GlobalAnnotationKey   string `json:"globalAnnotationKey,omitempty"`
-	GlobalAnnotationValue string `json:"globalAnnotationValue,omitempty"`
-}
-
 // OrchestratorSpec defines the desired state of Orchestrator.
 type OrchestratorSpec struct {
 	Namespace string `json:"namespace,omitempty"`
 	EventName string `json:"eventName"`
-	// 기본값을 주고 싶으면 default 태그 추가
 	// +kubebuilder:default=webhook
 	EventType string `json:"eventType,omitempty"`
 
-	// 옵션(컨트롤러에서 기본값 주입)
+	// Optional high-level condition expression for sensor (e.g., "A || B").
 	// +kubebuilder:validation:Optional
 	EventLogic string `json:"eventLogic,omitempty"`
 
-	// 옵션(컨트롤러에서 기본값 주입)
 	// 객체 필드는 pointer 로 두면 완전히 생략 가능
 	// +kubebuilder:validation:Optional
 	EventSource *EventSourceSpec `json:"eventSource,omitempty"`
+	// +kubebuilder:validation:Optional
+	EventSources []EventSourceSpec `json:"eventSources,omitempty"`
 
-	Service     ServiceSpec     `json:"service"` // Service.image는 필수 유지
-	Placement   PlacementPolicy `json:"placementPolicy,omitempty"`
-	Network     NetworkSpec     `json:"network,omitempty"`
-	EventBusRef string          `json:"eventBusRef,omitempty"`
+	// One or more Knative Services. When set, the controller should prefer this field.
+	// +kubebuilder:validation:Optional
+	// If empty, fallback to single Service for backward-compat.
+	// +kubebuilder:validation:Optional
+	Services []ServiceSpec `json:"services,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// Deprecated: prefer `services` when you need multiple kservices.
+	Service ServiceSpec `json:"service,omitempty"`
+
+	Placement PlacementPolicy `json:"placementPolicy,omitempty"`
+	// +kubebuilder:validation:Optional
+	Sensor *SensorSpec `json:"sensor,omitempty"`
 }
 
 // OrchestratorStatus defines the observed state of Orchestrator.
@@ -93,9 +110,6 @@ const (
 )
 
 // OrchestratorStatus holds runtime status fields.
-// +kubebuilder:validation:Enum=Pending;WaitingOnKsvc;WaitingOnNodePort;Ready;Error
-
-// Orchestrator status는 controller가 채움
 type OrchestratorStatus struct {
 	// +kubebuilder:validation:Enum=Pending;WaitingOnKsvc;WaitingOnNodePort;Ready;Error
 	Phase OrchestratorPhase `json:"phase,omitempty"`

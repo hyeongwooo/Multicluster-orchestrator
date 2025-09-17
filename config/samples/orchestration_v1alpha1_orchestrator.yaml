@@ -4,13 +4,27 @@ metadata:
   labels:
     app.kubernetes.io/name: orchestrator
     app.kubernetes.io/managed-by: kustomize
-  name: orchestrator-sample
+  name: traffic-monitor
 spec:
-  eventName: test             
-  namespace: user1                
-  eventType: webhook 
-  service: 
-    image: ghcr.io/knative/helloworld-go:latest
+  namespace: user1
+  eventName: traffic-monitor
+  eventSources:
+    - name: vehicle-detected
+      type: webhook
+    - name: over-speed
+      type: webhook
+    - name: pedestrian-detected
+      type: webhook
+  services:
+    - name: update
+      image: sjw980523/update:v1.2
+    - name: output
+      image: sjw980523/output:v1.2
+  eventLogic: 
+    "vehicle-detected || over-speed || pedestrian-detected"
+
+
+  
 
 
 

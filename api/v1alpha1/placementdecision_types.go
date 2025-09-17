@@ -38,8 +38,6 @@ type ClusterScore struct {
 	Final int32 `json:"final"`
 }
 
-
-
 type SelectedCluster struct {
 	Cluster  string `json:"cluster"`
 	Replicas *int32 `json:"replicas,omitempty"`
@@ -62,8 +60,6 @@ type PlacementWeight struct {
 	Hysteresis int32 `json:"hysteresis,omitempty"`
 }
 
-
-
 // ---- Spec/Status ----
 
 type PlacementDecisionSpec struct {
@@ -77,13 +73,12 @@ type PlacementDebug struct {
 	Queries map[string]string `json:"queries,omitempty"`
 }
 
-
 type PlacementDecisionStatus struct {
-	Selected   []SelectedCluster `json:"selected,omitempty"`
-	Scores     []ClusterScore    `json:"scores,omitempty"`
-	Reason     string            `json:"reason,omitempty"`
-	Updated    *metav1.Time      `json:"updated,omitempty"`
-	Debug      *PlacementDebug   `json:"debug,omitempty"`
+	Selected []SelectedCluster `json:"selected,omitempty"`
+	Scores   []ClusterScore    `json:"scores,omitempty"`
+	Reason   string            `json:"reason,omitempty"`
+	Updated  *metav1.Time      `json:"updated,omitempty"`
+	Debug    *PlacementDebug   `json:"debug,omitempty"`
 }
 
 // ---- CRD 루트 객체들만 object:root 마커 ----

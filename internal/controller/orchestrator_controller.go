@@ -11,7 +11,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	unstr "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	uobj "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -130,39 +129,94 @@ func (r *OrchestratorReconciler) defaultSpec(o *orchestrationv1alpha1.Orchestrat
 	if o.Spec.EventName == "" {
 		o.Spec.EventName = o.Name
 	}
+
+	// Back-compat: 단일 EventSource → 복수 EventSources 승격
+	if len(o.Spec.EventSources) == 0 && o.Spec.EventSource != nil && o.Spec.EventSource.Name != "" {
+		o.Spec.EventSources = []orchestrationv1alpha1.EventSourceSpec{*o.Spec.EventSource}
+	}
+
+	// EventSources 기본값
+	if len(o.Spec.EventSources) > 0 {
+		ports := randomPorts(len(o.Spec.EventSources), 10000)
+		for i := range o.Spec.EventSources {
+			es := &o.Spec.EventSources[i]
+			if es.Type == "" {
+				es.Type = "webhook"
+			}
+			if es.Port == 0 {
+				es.Port = ports[i]
+			}
+			if es.Params == nil {
+				es.Params = map[string]string{}
+			}
+			if es.Params["endpoint"] == "" {
+				name := es.Name
+				if name == "" {
+					name = o.Spec.EventName
+				}
+				es.Params["endpoint"] = "/" + name
+			}
+			if es.Params["method"] == "" {
+				es.Params["method"] = "POST"
+			}
+		}
+	} else {
+		// 레거시 단일 EventSource 기본값
+		if o.Spec.EventSource == nil {
+			o.Spec.EventSource = &orchestrationv1alpha1.EventSourceSpec{}
+		}
+		if o.Spec.EventSource.Type == "" {
+			o.Spec.EventSource.Type = "webhook"
+		}
+		if o.Spec.EventSource.Port == 0 {
+			rand.Seed(time.Now().UnixNano())
+			o.Spec.EventSource.Port = int32(10000 + rand.Intn(10000))
+		}
+		if o.Spec.EventSource.Params == nil {
+			o.Spec.EventSource.Params = map[string]string{}
+		}
+		if o.Spec.EventSource.Params["endpoint"] == "" {
+			o.Spec.EventSource.Params["endpoint"] = "/" + o.Spec.EventName
+		}
+		if o.Spec.EventSource.Params["method"] == "" {
+			o.Spec.EventSource.Params["method"] = "POST"
+		}
+	}
+
+	// Services: 리스트 우선. 단일 service 있으면 승격
+	if len(o.Spec.Services) == 0 && o.Spec.Service.Image != "" {
+		if o.Spec.Service.Name == "" {
+			o.Spec.Service.Name = nameKS(o.Spec.EventName)
+		}
+		o.Spec.Services = []orchestrationv1alpha1.ServiceSpec{o.Spec.Service}
+	}
+	for i := range o.Spec.Services {
+		if o.Spec.Services[i].ConcurrencyTarget != nil && *o.Spec.Services[i].ConcurrencyTarget < 1 {
+			v := int32(1)
+			o.Spec.Services[i].ConcurrencyTarget = &v
+		}
+	}
+
 	if o.Spec.EventType == "" {
 		o.Spec.EventType = "webhook"
 	}
-	if o.Spec.EventSource == nil {
-		o.Spec.EventSource = &orchestrationv1alpha1.EventSourceSpec{}
+}
+
+func randomPorts(n int, start int32) []int32 {
+	rand.Seed(time.Now().UnixNano())
+	used := map[int32]bool{}
+	out := make([]int32, n)
+	for i := 0; i < n; i++ {
+		for {
+			p := start + int32(rand.Intn(10000))
+			if !used[p] {
+				used[p] = true
+				out[i] = p
+				break
+			}
+		}
 	}
-	if o.Spec.EventSource.Type == "" {
-		o.Spec.EventSource.Type = "webhook"
-	}
-	if o.Spec.EventSource.Port == 0 {
-		rand.Seed(time.Now().UnixNano())
-		o.Spec.EventSource.Port = int32(10000 + rand.Intn(10000))
-	}
-	if o.Spec.EventSource.Params == nil {
-		o.Spec.EventSource.Params = map[string]string{}
-	}
-	if o.Spec.EventSource.Params["endpoint"] == "" {
-		o.Spec.EventSource.Params["endpoint"] = "/" + o.Spec.EventName
-	}
-	if o.Spec.EventSource.Params["method"] == "" {
-		o.Spec.EventSource.Params["method"] = "POST"
-	}
-	if o.Spec.Service.DomainSuffix == "" {
-		o.Spec.Service.DomainSuffix = "example.com"
-	}
-	if o.Spec.Service.ConcurrencyTarget != nil && *o.Spec.Service.ConcurrencyTarget < 1 {
-		v := int32(1)
-		o.Spec.Service.ConcurrencyTarget = &v
-	}
-	if o.Spec.Service.ConcurrencyTarget == nil {
-		v := int32(10)
-		o.Spec.Service.ConcurrencyTarget = &v
-	}
+	return out
 }
 
 func toEnvList(m map[string]string) []any {
@@ -213,9 +267,26 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			}
 		}
 	} else {
-		// 자식 리소스 정리
-		_ = r.deleteChild(ctx, orch.Spec.Namespace, nameKS(orch.Spec.EventName), "serving.knative.dev/v1", "Service")
-		_ = r.deleteChild(ctx, orch.Spec.Namespace, nameES(orch.Spec.EventName), "argoproj.io/v1alpha1", "EventSource")
+		// delete KServices
+		for _, s := range orch.Spec.Services {
+			_ = r.deleteChild(ctx, orch.Spec.Namespace, s.Name, "serving.knative.dev/v1", "Service")
+		}
+		if len(orch.Spec.Services) == 0 {
+			_ = r.deleteChild(ctx, orch.Spec.Namespace, nameKS(orch.Spec.EventName), "serving.knative.dev/v1", "Service")
+		}
+
+		// delete EventSources
+		if len(orch.Spec.EventSources) > 0 {
+			for _, es := range orch.Spec.EventSources {
+				_ = r.deleteChild(ctx, orch.Spec.Namespace, es.Name, "argoproj.io/v1alpha1", "EventSource")
+				_ = r.deleteChild(ctx, orch.Spec.Namespace, es.Name+"-np", "v1", "Service")
+			}
+		} else {
+			_ = r.deleteChild(ctx, orch.Spec.Namespace, nameES(orch.Spec.EventName), "argoproj.io/v1alpha1", "EventSource")
+			_ = r.deleteChild(ctx, orch.Spec.Namespace, nameESNodePortSvc(orch.Spec.EventName), "v1", "Service")
+		}
+
+		// sensor / workflowtemplate / policies
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, nameSN(orch.Spec.EventName), "argoproj.io/v1alpha1", "Sensor")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, nameWT(orch.Spec.EventName), "argoproj.io/v1alpha1", "WorkflowTemplate")
 		_ = r.deleteChild(ctx, orch.Spec.Namespace, namePP(orch.Spec.EventName), "policy.karmada.io/v1alpha1", "PropagationPolicy")
@@ -232,30 +303,12 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// 0) 기본값 주입
 	r.defaultSpec(&orch)
 
-	// 1) 베이스 리소스(ksvc / eventsource) 생성
-	ksvcURL, err := r.ensureKnativeServiceAndURL(ctx, &orch)
-	if err != nil {
+	// 1) 베이스 리소스(KServices / EventSources) 생성
+	if err := r.ensureKnativeServices(ctx, &orch); err != nil {
 		return r.fail(&orch, "EnsureKsvcFailed", err)
 	}
-
-	// Ksvc 실제 URL/Ready 반영
-	url, ready, _ := r.readKsvcURL(ctx, &orch)
-	if ready && url != "" {
-		ksvcURL = url
-		r.setCond(&orch, "KnativeReady", metav1.ConditionTrue, "Applied", ksvcURL)
-	} else {
-		r.setCond(&orch, "KnativeReady", metav1.ConditionUnknown, "Pending", "Waiting Knative URL")
-	}
-
 	if _, err := r.ensureEventSourceNodePort(ctx, &orch); err != nil {
 		return r.fail(&orch, "EnsureEventSourceFailed", err)
-	}
-	np, _ := r.readEventSourceNodePort(ctx, &orch)
-	if np > 0 {
-		orch.Status.ESNodePort = np
-		r.setCond(&orch, "EventSourceServiceReady", metav1.ConditionTrue, "Applied", fmt.Sprintf("NodePort=%d", np))
-	} else {
-		r.setCond(&orch, "EventSourceServiceReady", metav1.ConditionUnknown, "Pending", "Waiting NodePort allocation")
 	}
 
 	// 2) PlacementDecision 확보(없으면 생성만) → 선택 기다림
@@ -264,23 +317,12 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.fail(&orch, "EnsurePlacementFailed", err)
 	}
 	if len(pd.Status.Selected) == 0 {
-		orch.Status.KsvcURL = ksvcURL
 		now := metav1.Now()
 		orch.Status.LastPlacementTime = &now
-
-		switch {
-		case !ready || ksvcURL == "":
-			r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnKsvc, "Waiting for Knative URL")
-		case orch.Status.ESNodePort == 0:
-			r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnNodePort, "Waiting for EventSource NodePort")
-		default:
-			r.setPhase(&orch, orchestrationv1alpha1.PhasePending, "Base resources created; waiting for PlacementDecision")
-		}
-
+		r.setPhase(&orch, orchestrationv1alpha1.PhasePending, "Base resources created; waiting for PlacementDecision")
 		_ = r.Status().Update(ctx, &orch)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-
 
 	// 3) 대상 클러스터 계산 (PD 선택 결과 기반)
 	selected := extractClusters(pd.Status.Selected)
@@ -292,8 +334,15 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.fail(&orch, "ApplyNamespaceCPPFailed", err)
 	}
 
-	// 4) 정책 생성 (ES/WT/Others + WT URL Override)
-	policyObjs := r.renderPoliciesESWTAndOthers(&orch, pd)
+	primary := []string{}
+	if len(selected) > 0 {
+		primary = []string{selected[0]}
+	}
+	// 4) 정책 생성
+	//    - PrimaryOnly: WT/Sensor + EventSource/NodePort (항상 primary)
+	//    - KSvc: 현재는 primary 에만 배포하도록 제한 (svcTargets = primary)
+	svcTargets := primary
+	policyObjs := r.renderPoliciesSplit(&orch, svcTargets, primary)
 	for _, o := range policyObjs {
 		setOwner(&orch, o, r.Scheme)
 	}
@@ -302,7 +351,7 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// 5) 베이스(ksvc/wt/sensor) 생성/패치 - 고정 EventBus("default") 사용
-	baseObjs := r.renderBase(&orch, ksvcURL, "default")
+	baseObjs := r.renderBase(&orch, "default")
 	for _, o := range baseObjs {
 		setOwner(&orch, o, r.Scheme)
 	}
@@ -311,17 +360,10 @@ func (r *OrchestratorReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// 6) Status 최종 업데이트
-	orch.Status.KsvcURL = ksvcURL
 	orch.Status.SelectedClusters = selected
 
 	// 간단한 Phase 계산
-	if !ready || ksvcURL == "" {
-		r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnKsvc, "Waiting for Knative URL")
-	} else if orch.Status.ESNodePort == 0 {
-		r.setPhase(&orch, orchestrationv1alpha1.PhaseWaitingOnNodePort, "Waiting for EventSource NodePort")
-	} else {
-		r.setPhase(&orch, orchestrationv1alpha1.PhaseReady, "All resources applied")
-	}
+	r.setPhase(&orch, orchestrationv1alpha1.PhaseReady, "All resources applied")
 
 	if err := r.Status().Update(ctx, &orch); err != nil {
 		return ctrl.Result{}, err
@@ -442,92 +484,123 @@ func (r *OrchestratorReconciler) fail(orch *orchestrationv1alpha1.Orchestrator, 
 // Renderers: KService / EventSource / WorkflowTemplate / Sensor
 // ──────────────────────────────────────────────────────────────
 
-func (r *OrchestratorReconciler) ensureKnativeServiceAndURL(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator) (string, error) {
-	ksvc := renderKService(orch)
-	applyCommonLabel(ksvc, orch.Spec.EventName)
-	setOwner(orch, ksvc, r.Scheme)
-	if err := r.applyAll(ctx, []*uobj.Unstructured{ksvc}); err != nil {
-		return "", err
-	}
-
-	for i := 0; i < 30; i++ {
-		url, ready, err := r.readKsvcURL(ctx, orch)
-		if err == nil && ready && url != "" {
-			return url, nil
+func renderKServices(orch *orchestrationv1alpha1.Orchestrator) []*uobj.Unstructured {
+	objs := []*uobj.Unstructured{}
+	for _, svc := range orch.Spec.Services {
+		container := map[string]any{
+			"image": svc.Image,
 		}
-		time.Sleep(500 * time.Millisecond)
+		if env := toEnvList(svc.Env); len(env) > 0 {
+			container["env"] = env
+		}
+		spec := map[string]any{
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []any{container},
+				},
+			},
+		}
+		if svc.ConcurrencyTarget != nil {
+			tmpl := spec["template"].(map[string]any)
+			md, ok := tmpl["metadata"].(map[string]any)
+			if !ok || md == nil {
+				md = map[string]any{}
+				tmpl["metadata"] = md
+			}
+			md["annotations"] = map[string]any{
+				"autoscaling.knative.dev/target": fmt.Sprintf("%d", *svc.ConcurrencyTarget),
+			}
+		}
+		u := &uobj.Unstructured{}
+		u.Object = map[string]any{
+			"apiVersion": "serving.knative.dev/v1",
+			"kind":       "Service",
+			"metadata": map[string]any{
+				"name":      svc.Name,
+				"namespace": orch.Spec.Namespace,
+			},
+			"spec": spec,
+		}
+		objs = append(objs, u)
 	}
-	return fmt.Sprintf("http://%s.%s.svc", nameKS(orch.Spec.EventName), orch.Spec.Namespace), nil
+	return objs
 }
 
-func renderKService(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
-	container := map[string]any{
-		"image": orch.Spec.Service.Image,
+func (r *OrchestratorReconciler) ensureKnativeServices(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator) error {
+	kobjs := renderKServices(orch)
+	for _, o := range kobjs {
+		applyCommonLabel(o, orch.Spec.EventName)
+		setOwner(orch, o, r.Scheme)
 	}
-	if env := toEnvList(orch.Spec.Service.Env); len(env) > 0 {
-		container["env"] = env
-	}
+	return r.applyAll(ctx, kobjs)
+}
 
-	spec := map[string]any{
-		"template": map[string]any{
+// 기존: func renderEventSources(orch *orchestrationv1alpha1.Orchestrator) []*uobj.Unstructured {
+func renderEventSources(orch *orchestrationv1alpha1.Orchestrator) []*uobj.Unstructured {
+	objs := []*uobj.Unstructured{}
+	for _, es := range orch.Spec.EventSources {
+		endpoint := es.Params["endpoint"]
+		if endpoint == "" {
+			endpoint = "/" + es.Name
+		}
+		method := es.Params["method"]
+		if method == "" {
+			method = "POST"
+		}
+		u := &uobj.Unstructured{}
+		u.Object = map[string]any{
+			"apiVersion": "argoproj.io/v1alpha1",
+			"kind":       "EventSource",
+			"metadata": map[string]any{
+				"name":      es.Name,
+				"namespace": orch.Spec.Namespace, //
+			},
 			"spec": map[string]any{
-				"containers": []any{container},
-			},
-		},
-	}
-
-	if orch.Spec.Service.ConcurrencyTarget != nil {
-		tmpl := spec["template"].(map[string]any)
-		if tmpl["metadata"] == nil {
-			tmpl["metadata"] = map[string]any{}
-		}
-		md := tmpl["metadata"].(map[string]any)
-		md["annotations"] = map[string]any{
-			"autoscaling.knative.dev/target": fmt.Sprintf("%d", *orch.Spec.Service.ConcurrencyTarget),
-		}
-	}
-
-	u := &uobj.Unstructured{}
-	u.Object = map[string]any{
-		"apiVersion": "serving.knative.dev/v1",
-		"kind":       "Service",
-		"metadata": map[string]any{
-			"name":      nameKS(orch.Spec.EventName),
-			"namespace": orch.Spec.Namespace,
-		},
-		"spec": spec,
-	}
-	return u
-}
-
-func renderEventSource(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
-	name := nameES(orch.Spec.EventName)
-	port := orch.Spec.EventSource.Port
-
-	u := &uobj.Unstructured{}
-	u.Object = map[string]any{
-		"apiVersion": "argoproj.io/v1alpha1",
-		"kind":       "EventSource",
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": orch.Spec.Namespace,
-		},
-		"spec": map[string]any{
-			"service": map[string]any{
-				"ports": []any{
-					map[string]any{"port": port, "targetPort": port},
+				"service": map[string]any{
+					"ports": []any{
+						map[string]any{"port": es.Port, "targetPort": es.Port},
+					},
+				},
+				"webhook": map[string]any{
+					es.Name: map[string]any{
+						"port":     fmt.Sprintf("%d", es.Port),
+						"endpoint": endpoint,
+						"method":   method,
+					},
 				},
 			},
-			"webhook": map[string]any{
-				orch.Spec.EventName: map[string]any{
-					"port":     fmt.Sprintf("%d", port),
-					"endpoint": orch.Spec.EventSource.Params["endpoint"],
-					"method":   orch.Spec.EventSource.Params["method"],
-				},
+		}
+		objs = append(objs, u)
+
+		// 항상 NodePort Service를 생성하되, 고정 포트를 원할 때만 nodePort를 지정한다.
+		svcPort := map[string]any{
+			"name":       "http",
+			"port":       es.Port,
+			"targetPort": es.Port,
+		}
+		if es.NodePort > 0 {
+			svcPort["nodePort"] = es.NodePort
+		}
+
+		svc := &uobj.Unstructured{}
+		svc.Object = map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Service",
+			"metadata": map[string]any{
+				"name":      es.Name + "-np",
+				"namespace": orch.Spec.Namespace,
 			},
-		},
+			"spec": map[string]any{
+				"type": "NodePort",
+				"selector": map[string]any{
+					"eventsource-name": es.Name,
+				},
+				"ports": []any{svcPort},
+			},
+		}
+		objs = append(objs, svc)
 	}
-	return u
+	return objs
 }
 
 func renderEventSourceNodePortService(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
@@ -569,8 +642,38 @@ func renderEventSourceNodePortService(orch *orchestrationv1alpha1.Orchestrator) 
 	return u
 }
 
-func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, ksvcURL string) *uobj.Unstructured {
+func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator) *uobj.Unstructured {
 	name := nameWT(orch.Spec.EventName)
+
+	stepsNested := []any{}
+	for _, svc := range orch.Spec.Services {
+		step := map[string]any{
+			"name":     svc.Name,
+			"template": svc.Name,
+		}
+		stepsNested = append(stepsNested, []any{step})
+	}
+
+	templates := []any{
+		map[string]any{
+			"name":  "main",
+			"steps": stepsNested,
+		},
+	}
+
+	for _, svc := range orch.Spec.Services {
+		tmpl := map[string]any{
+			"name": svc.Name,
+			"http": map[string]any{
+				"url":    fmt.Sprintf("http://%s.%s.svc.cluster.local", svc.Name, orch.Spec.Namespace),
+				"method": "POST",
+				"headers": []any{
+					map[string]any{"name": "Content-Type", "value": "application/json"},
+				},
+			},
+		}
+		templates = append(templates, tmpl)
+	}
 
 	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
@@ -581,35 +684,14 @@ func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, ksvcURL st
 			"namespace": orch.Spec.Namespace,
 		},
 		"spec": map[string]any{
-			"templates": []any{
-				map[string]any{
-					"name": "main",
-					"steps": []any{
-						[]any{
-							map[string]any{
-								"name":     "call-func",
-								"template": "call-func",
-							},
-						},
-					},
-				},
-				map[string]any{
-					"name": "call-func",
-					"http": map[string]any{
-						"url":    ksvcURL,
-						"method": "GET",
-						"headers": []any{
-							map[string]any{"name": "Content-Type", "value": "application/json"},
-						},
-					},
-				},
-			},
+			"entrypoint": "main",
+			"templates":  templates,
 		},
 	}
 	return u
 }
 
-func renderSensor(orch *orchestrationv1alpha1.Orchestrator, eventBusName string) *uobj.Unstructured {
+func renderLegacySensor(orch *orchestrationv1alpha1.Orchestrator, eventBusName string) *uobj.Unstructured {
 	sensorName := nameSN(orch.Spec.EventName)
 	wtName := nameWT(orch.Spec.EventName)
 
@@ -642,13 +724,10 @@ func renderSensor(orch *orchestrationv1alpha1.Orchestrator, eventBusName string)
 			},
 		},
 	}
-	if strings.TrimSpace(orch.Spec.EventLogic) != "" {
-		trigger["conditions"] = orch.Spec.EventLogic
-	}
 
 	spec := map[string]any{
 		"template": map[string]any{
-			"eventBusName":       eventBusName, // "default"
+			"eventBusName":       eventBusName,
 			"serviceAccountName": "operate-workflow-sa",
 		},
 		"dependencies": dependencies,
@@ -674,29 +753,21 @@ func renderClusterPropagationPolicyNamespace(
 	orch *orchestrationv1alpha1.Orchestrator,
 	clusterNames []string,
 ) *uobj.Unstructured {
-	// This CPP ensures the target Namespace exists on all target clusters,
-	// so that namespaced resources (WT/Sensor/KSvc/ES) can be propagated cleanly.
 	name := fmt.Sprintf("%s-cpp-ns-%s", orch.Spec.EventName, orch.Spec.Namespace)
 
 	u := &uobj.Unstructured{}
 	u.SetAPIVersion("policy.karmada.io/v1alpha1")
 	u.SetKind("ClusterPropagationPolicy")
 	u.SetName(name)
-
 	u.Object = map[string]any{
 		"apiVersion": "policy.karmada.io/v1alpha1",
 		"kind":       "ClusterPropagationPolicy",
 		"metadata": map[string]any{
 			"name": name,
-			// Cluster-scoped, no namespace
 		},
 		"spec": map[string]any{
 			"resourceSelectors": []any{
-				map[string]any{
-					"apiVersion": "v1",
-					"kind":       "Namespace",
-					"name":       orch.Spec.Namespace,
-				},
+				map[string]any{"apiVersion": "v1", "kind": "Namespace", "name": orch.Spec.Namespace},
 			},
 			"placement": map[string]any{
 				"clusterAffinity": map[string]any{
@@ -705,34 +776,32 @@ func renderClusterPropagationPolicyNamespace(
 			},
 		},
 	}
-
 	return u
 }
 
-// ──────────────────────────────────────────────────────────────
-// Policies
-// ──────────────────────────────────────────────────────────────
-
-// ES/WT 및 Others 정책 + WT URL OP
-func (r *OrchestratorReconciler) renderPoliciesESWTAndOthers(
+// Policies (split):
+//   - PrimaryOnly: WT + Sensor + EventSource + ES NodePort (항상 primary에만 전파)
+//   - Multi: KSvc (두 번째 인자에 넘긴 대상 클러스터로 전파; 현재 호출부에서는 primary만 전달)
+func (r *OrchestratorReconciler) renderPoliciesSplit(
 	orch *orchestrationv1alpha1.Orchestrator,
-	pd *orchestrationv1alpha1.PlacementDecision,
+	selected []string,
+	primary []string,
 ) []*uobj.Unstructured {
 	objs := []*uobj.Unstructured{}
 
-	// ES/WT 전용 PP
-	ppESWT := renderPropagationPolicyESWT(orch, pd)
-	applyCommonLabel(ppESWT, orch.Spec.EventName)
-	objs = append(objs, ppESWT)
+	// WT + Sensor -> primary only
+	ppPrimary := renderPropagationPolicyPrimaryOnly(orch, primary)
+	applyCommonLabel(ppPrimary, orch.Spec.EventName)
+	objs = append(objs, ppPrimary)
 
-	// Others(KSvc/Sensor/ES NodePort) 전용 PP
-	ppOthers := renderPropagationPolicyOthers(orch, pd)
-	applyCommonLabel(ppOthers, orch.Spec.EventName)
-	objs = append(objs, ppOthers)
+	// KSvc + ES + ES NodePort -> selected clusters
+	ppMulti := renderPropagationPolicyMulti(orch, selected)
+	applyCommonLabel(ppMulti, orch.Spec.EventName)
+	objs = append(objs, ppMulti)
 
-	// WT URL OverridePolicy (도메인맵 기반)
+	// WT URL override -> primary only (nip.io per-cluster)
 	if domap, err := r.loadDomainMap(context.Background(), orch.Spec.Namespace); err == nil {
-		if op := renderOverridePolicyForWT(orch, pd, domap); op != nil {
+		if op := renderOverridePolicyForWTPrimaryOnly(orch, primary, domap); op != nil {
 			applyCommonLabel(op, orch.Spec.EventName)
 			objs = append(objs, op)
 		}
@@ -740,123 +809,115 @@ func (r *OrchestratorReconciler) renderPoliciesESWTAndOthers(
 	return objs
 }
 
-// ES/WT 전용 PropagationPolicy
-func renderPropagationPolicyESWT(
+// PrimaryOnly: WT + Sensor + EventSource + NodePort Service
+func renderPropagationPolicyPrimaryOnly(
 	orch *orchestrationv1alpha1.Orchestrator,
-	pd *orchestrationv1alpha1.PlacementDecision,
+	primary []string,
 ) *uobj.Unstructured {
-	name := namePPESWT(orch.Spec.EventName)
-	selected := extractClusters(pd.Status.Selected)
+	name := fmt.Sprintf("%s-pp-primary", orch.Spec.EventName)
+
+	// WT + Sensor (must co-locate)
+	selectors := []any{
+		map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "WorkflowTemplate", "name": nameWT(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+		map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "Sensor", "name": nameSN(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+	}
+
+	// EventSources + NodePort Services (deploy only on primary)
+	if len(orch.Spec.EventSources) > 0 {
+		for _, es := range orch.Spec.EventSources {
+			selectors = append(selectors,
+				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventSource", "name": es.Name, "namespace": orch.Spec.Namespace},
+				map[string]any{"apiVersion": "v1", "kind": "Service", "name": es.Name + "-np", "namespace": orch.Spec.Namespace},
+			)
+		}
+	} else {
+		// legacy single ES path
+		selectors = append(selectors,
+			map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventSource", "name": nameES(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+			map[string]any{"apiVersion": "v1", "kind": "Service", "name": nameESNodePortSvc(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
+		)
+	}
 
 	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
 		"apiVersion": "policy.karmada.io/v1alpha1",
 		"kind":       "PropagationPolicy",
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": orch.Spec.Namespace,
-		},
+		"metadata":   map[string]any{"name": name, "namespace": orch.Spec.Namespace},
 		"spec": map[string]any{
-			"resourceSelectors": []any{
-				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "WorkflowTemplate", "name": nameWT(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
-				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "EventSource", "name": nameES(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
-			},
-			"placement": map[string]any{
-				"clusterAffinity": map[string]any{
-					"clusterNames": toAnySlice(selected),
-				},
-			},
+			"resourceSelectors": selectors,
+			"placement":         map[string]any{"clusterAffinity": map[string]any{"clusterNames": toAnySlice(primary)}},
 		},
 	}
 	return u
 }
 
-// Others(KSvc/Sensor/ES NodePort) 전용 PropagationPolicy
-func renderPropagationPolicyOthers(
+// Multi: KSvc (Knative Service) only
+func renderPropagationPolicyMulti(
 	orch *orchestrationv1alpha1.Orchestrator,
-	pd *orchestrationv1alpha1.PlacementDecision,
+	selected []string,
 ) *uobj.Unstructured {
-	name := namePPOthers(orch.Spec.EventName)
-	selected := extractClusters(pd.Status.Selected)
+	name := fmt.Sprintf("%s-pp-multi", orch.Spec.EventName)
+	selectors := []any{}
+
+	// KServices (one or many)
+	if len(orch.Spec.Services) > 0 {
+		for _, s := range orch.Spec.Services {
+			selectors = append(selectors, map[string]any{
+				"apiVersion": "serving.knative.dev/v1", "kind": "Service", "name": s.Name, "namespace": orch.Spec.Namespace,
+			})
+		}
+	} else {
+		selectors = append(selectors, map[string]any{
+			"apiVersion": "serving.knative.dev/v1", "kind": "Service", "name": nameKS(orch.Spec.EventName), "namespace": orch.Spec.Namespace,
+		})
+	}
 
 	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
 		"apiVersion": "policy.karmada.io/v1alpha1",
 		"kind":       "PropagationPolicy",
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": orch.Spec.Namespace,
-		},
+		"metadata":   map[string]any{"name": name, "namespace": orch.Spec.Namespace},
 		"spec": map[string]any{
-			"resourceSelectors": []any{
-				map[string]any{"apiVersion": "serving.knative.dev/v1", "kind": "Service", "name": nameKS(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
-				map[string]any{"apiVersion": "argoproj.io/v1alpha1", "kind": "Sensor", "name": nameSN(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
-				map[string]any{"apiVersion": "v1", "kind": "Service", "name": nameESNodePortSvc(orch.Spec.EventName), "namespace": orch.Spec.Namespace},
-			},
-			"placement": map[string]any{
-				"clusterAffinity": map[string]any{
-					"clusterNames": toAnySlice(selected),
-				},
-			},
+			"resourceSelectors": selectors,
+			"placement":         map[string]any{"clusterAffinity": map[string]any{"clusterNames": toAnySlice(selected)}},
 		},
 	}
 	return u
 }
 
-func renderOverridePolicyForWT(
+// WT URL Override (primary only)
+func renderOverridePolicyForWTPrimaryOnly(
 	orch *orchestrationv1alpha1.Orchestrator,
-	pd *orchestrationv1alpha1.PlacementDecision,
+	primary []string,
 	domap map[string]clusterEndpoint,
 ) *uobj.Unstructured {
-	u := &uobj.Unstructured{}
-	u.SetAPIVersion("policy.karmada.io/v1alpha1")
-	u.SetKind("OverridePolicy")
-	u.SetName(fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName))
-	u.SetNamespace(orch.Spec.Namespace)
-
-	selected := extractClusters(pd.Status.Selected)
-
+	if len(primary) == 0 {
+		return nil
+	}
+	name := fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName)
 	rules := []any{}
-	for _, c := range selected {
+	for _, c := range primary {
 		ep, ok := domap[c]
 		if !ok || ep.IP == "" || ep.Port == 0 {
 			continue
 		}
-		finalURL := fmt.Sprintf("http://%s.%s.%s.nip.io:%d",
-			nameKS(orch.Spec.EventName), orch.Spec.Namespace, ep.IP, ep.Port)
-
+		finalURL := fmt.Sprintf("http://%s.%s.%s.nip.io:%d", nameKS(orch.Spec.EventName), orch.Spec.Namespace, ep.IP, ep.Port)
 		rules = append(rules, map[string]any{
-			"targetCluster": map[string]any{
-				"clusterNames": []any{c},
-			},
-			"overriders": map[string]any{
-				"plaintext": []any{
-					map[string]any{
-						"path":     "/spec/templates/1/http/url",
-						"operator": "replace",
-						"value":    finalURL,
-					},
-				},
-			},
+			"targetCluster": map[string]any{"clusterNames": []any{c}},
+			"overriders": map[string]any{"plaintext": []any{map[string]any{
+				"path": "/spec/templates/1/http/url", "operator": "replace", "value": finalURL,
+			}}},
 		})
 	}
-
+	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
 		"apiVersion": "policy.karmada.io/v1alpha1",
 		"kind":       "OverridePolicy",
-		"metadata": map[string]any{
-			"name":      fmt.Sprintf("%s-wt-url-override", orch.Spec.EventName),
-			"namespace": orch.Spec.Namespace,
-		},
+		"metadata":   map[string]any{"name": name, "namespace": orch.Spec.Namespace},
 		"spec": map[string]any{
-			"resourceSelectors": []any{
-				map[string]any{
-					"apiVersion": "argoproj.io/v1alpha1",
-					"kind":       "WorkflowTemplate",
-					"name":       nameWT(orch.Spec.EventName),
-					"namespace":  orch.Spec.Namespace,
-				},
-			},
+			"resourceSelectors": []any{map[string]any{
+				"apiVersion": "argoproj.io/v1alpha1", "kind": "WorkflowTemplate", "name": nameWT(orch.Spec.EventName), "namespace": orch.Spec.Namespace,
+			}},
 			"overrideRules": rules,
 		},
 	}
@@ -871,24 +932,30 @@ func (r *OrchestratorReconciler) ensureEventSourceNodePort(
 	ctx context.Context,
 	orch *orchestrationv1alpha1.Orchestrator,
 ) (int32, error) {
-	es := renderEventSource(orch)
-	applyCommonLabel(es, orch.Spec.EventName)
-	setOwner(orch, es, r.Scheme)
-	if err := r.applyAll(ctx, []*uobj.Unstructured{es}); err != nil {
+	// EventSource를 EventBus가 있는 NS로 생성
+
+	esObjs := renderEventSources(orch)
+	for _, o := range esObjs {
+		applyCommonLabel(o, orch.Spec.EventName)
+		setOwner(orch, o, r.Scheme)
+	}
+	if err := r.applyAll(ctx, esObjs); err != nil {
 		return 0, err
 	}
 
-	svc := renderEventSourceNodePortService(orch)
-	if svc != nil {
-		applyCommonLabel(svc, orch.Spec.EventName)
-		setOwner(orch, svc, r.Scheme)
-		if err := r.applyAll(ctx, []*uobj.Unstructured{svc}); err != nil {
-			return 0, err
+	// 레거시 단일 EventSource 경로만 기존 NodePort Svc 유지
+	if len(orch.Spec.EventSources) == 0 && orch.Spec.EventSource != nil {
+		svc := renderEventSourceNodePortService(orch)
+		if svc != nil {
+			applyCommonLabel(svc, orch.Spec.EventName)
+			setOwner(orch, svc, r.Scheme)
+			if err := r.applyAll(ctx, []*uobj.Unstructured{svc}); err != nil {
+				return 0, err
+			}
 		}
-	}
-	// 명시 고정 NodePort가 있으면 바로 반환
-	if orch.Spec.EventSource.NodePort > 0 {
-		return orch.Spec.EventSource.NodePort, nil
+		if orch.Spec.EventSource.NodePort > 0 {
+			return orch.Spec.EventSource.NodePort, nil
+		}
 	}
 	return 0, nil
 }
@@ -897,6 +964,9 @@ func (r *OrchestratorReconciler) readEventSourceNodePort(
 	ctx context.Context,
 	orch *orchestrationv1alpha1.Orchestrator,
 ) (int32, error) {
+	if len(orch.Spec.EventSources) > 0 || orch.Spec.EventSource == nil {
+		return 0, nil
+	}
 	svc := &corev1.Service{}
 	if err := r.Get(ctx, client.ObjectKey{
 		Namespace: orch.Spec.Namespace,
@@ -913,45 +983,86 @@ func (r *OrchestratorReconciler) readEventSourceNodePort(
 // --- 베이스 리소스 렌더러 (WT + Sensor) ---
 func (r *OrchestratorReconciler) renderBase(
 	orch *orchestrationv1alpha1.Orchestrator,
-	ksvcURL string,
 	eventBusName string,
 ) []*uobj.Unstructured {
-	wt := renderWorkflowTemplate(orch, ksvcURL)
-	sn := renderSensor(orch, eventBusName)
+	wt := renderWorkflowTemplate(orch)
+
+	var sn *uobj.Unstructured
+	if len(orch.Spec.EventSources) > 0 {
+		// build sensor from list of event sources using EventLogic if provided
+		sensorName := nameSN(orch.Spec.EventName)
+		wtName := nameWT(orch.Spec.EventName)
+
+		dependencies := []any{}
+		for _, es := range orch.Spec.EventSources {
+			if strings.TrimSpace(es.Name) == "" {
+				continue
+			}
+			dependencies = append(dependencies, map[string]any{
+				"name":                 es.Name,
+				"eventSourceName":      es.Name,
+				"eventSourceNamespace": orch.Spec.Namespace,
+				"eventName":            es.Name,
+			})
+		}
+
+		wfObj := map[string]any{
+			"apiVersion": "argoproj.io/v1alpha1",
+			"kind":       "Workflow",
+			"metadata":   map[string]any{"generateName": fmt.Sprintf("%s-", orch.Spec.EventName)},
+			"spec": map[string]any{
+				"serviceAccountName":  "operate-workflow-sa",
+				"entrypoint":          "main",
+				"workflowTemplateRef": map[string]any{"name": wtName},
+			},
+		}
+
+		trigger := map[string]any{
+			"template": map[string]any{
+				"name": sensorName + "-trigger",
+				"argoWorkflow": map[string]any{
+					"operation": "submit",
+					"source":    map[string]any{"resource": wfObj},
+				},
+			},
+		}
+		if strings.TrimSpace(orch.Spec.EventLogic) != "" {
+			trigger["conditions"] = orch.Spec.EventLogic
+		}
+
+		spec := map[string]any{
+			"template": map[string]any{
+				"eventBusName":       eventBusName, // "default" 등
+				"serviceAccountName": "operate-workflow-sa",
+			},
+			"dependencies": dependencies,
+			"triggers":     []any{trigger},
+		}
+
+		sn = &uobj.Unstructured{}
+		sn.Object = map[string]any{
+			"apiVersion": "argoproj.io/v1alpha1",
+			"kind":       "Sensor",
+			"metadata": map[string]any{
+				"name":      sensorName,
+				"namespace": orch.Spec.Namespace, //
+			},
+			"spec": spec,
+		}
+	} else {
+		// legacy single-EventSource path
+		sn = renderLegacySensor(orch, eventBusName)
+		// ✅ 레거시도 동일하게 Sensor NS 보정
+		if md, ok := sn.Object["metadata"].(map[string]any); ok {
+			md["namespace"] = orch.Spec.Namespace
+		}
+	}
+
 	applyCommonLabel(wt, orch.Spec.EventName)
 	applyCommonLabel(sn, orch.Spec.EventName)
 	setOwner(orch, wt, r.Scheme)
 	setOwner(orch, sn, r.Scheme)
 	return []*uobj.Unstructured{wt, sn}
-}
-
-func (r *OrchestratorReconciler) readKsvcURL(ctx context.Context, orch *orchestrationv1alpha1.Orchestrator) (string, bool, error) {
-	u := &uobj.Unstructured{}
-	u.SetAPIVersion("serving.knative.dev/v1")
-	u.SetKind("Service")
-	key := client.ObjectKey{Namespace: orch.Spec.Namespace, Name: nameKS(orch.Spec.EventName)}
-	if err := r.Get(ctx, key, u); err != nil {
-		return "", false, err
-	}
-
-	status, found, _ := unstr.NestedMap(u.Object, "status")
-	if !found || status == nil {
-		return "", false, nil
-	}
-
-	url, _, _ := unstr.NestedString(u.Object, "status", "url")
-	conds, _, _ := unstr.NestedSlice(u.Object, "status", "conditions")
-
-	ready := false
-	for _, c := range conds {
-		if m, ok := c.(map[string]any); ok {
-			if m["type"] == "Ready" && m["status"] == "True" {
-				ready = true
-				break
-			}
-		}
-	}
-	return url, ready, nil
 }
 
 // ──────────────────────────────────────────────────────────────

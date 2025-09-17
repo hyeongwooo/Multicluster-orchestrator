@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,6 +35,7 @@ type PlacementDecisionReconciler struct {
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=orchestration.operator.io,resources=placementdecisions/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups=orchestration.operator.io,resources=orchestrators,verbs=get;list;watch
 
 // ──────────────────────────────────────────────────────────────
 // Prometheus API response
@@ -53,10 +53,6 @@ type promAPIResponse struct {
 const (
 	defaultHysteresisMargin int32         = 50
 	defaultStickiness       time.Duration = 90 * time.Second
-
-	defaultMonPath    = "/healthz"
-	defaultHTTPTO     = 2 * time.Second
-	defaultUseCluster = true
 )
 
 // ──────────────────────────────────────────────────────────────
@@ -153,6 +149,13 @@ func loadQueries(ctx context.Context, c client.Client, ns string) qset {
 	return qs
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 type rawScore struct {
 	CPU, Mem, GPU, Lat float64
 	Final              int32
@@ -236,17 +239,6 @@ func weightsFromSpec(orch *orchestrationv1alpha1.Orchestrator) (wCPU, wMem, wGPU
 	return
 }
 
-// EB home policy: annotation → env → best(eswt)
-func decideEBHome(pd *orchestrationv1alpha1.PlacementDecision, best string) string {
-	if v := strings.TrimSpace(pd.Annotations["orchestrator.operator.io/eb-home"]); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(os.Getenv("EB_HOME")); v != "" {
-		return v
-	}
-	return best
-}
-
 func loadDomainMap(ctx context.Context, c client.Client, ns string) (map[string]clusterEndpoint, error) {
 	cm := &corev1.ConfigMap{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: "orchestrator-domain-map"}, cm); err != nil {
@@ -285,80 +277,6 @@ func loadDomainMap(ctx context.Context, c client.Client, ns string) (map[string]
 	return out, nil
 }
 
-// buildBusURLs returns (scheme, hostFQDN, clientURL, monitorURL).
-// 우선순위:
-// 1) PD_BUS_NODEPORT=host:port 가 있으면 그걸 사용 (외부 노드포트 공개형 BYO)
-// 2) PD_BUS_HOST=host:port 가 있으면 그걸 사용
-// 3) clusterset 여부에 따라 nats-bus.<ns>.svc[.clusterset].local:4222
-func buildBusURLs(ns string) (scheme, hostFQDN, clientURL, monitorURL string) {
-	scheme = "tls"
-	if v := strings.TrimSpace(os.Getenv("PD_BUS_SCHEME")); v != "" {
-		scheme = v
-	}
-
-	if hp := strings.TrimSpace(os.Getenv("PD_BUS_NODEPORT")); hp != "" {
-		// host:port
-		hostFQDN = hp
-		clientURL = fmt.Sprintf("%s://%s", scheme, hostFQDN)
-		// 모니터는 http로 열렸다고 가정(포트는 노드포트가 다를 수 있으니 생략)
-		monitorURL = fmt.Sprintf("http://%s/healthz", hostFQDN)
-		return
-	}
-	if hp := strings.TrimSpace(os.Getenv("PD_BUS_HOST")); hp != "" {
-		hostFQDN = hp
-		clientURL = fmt.Sprintf("%s://%s", scheme, hostFQDN)
-		monitorURL = fmt.Sprintf("http://%s/healthz", hostFQDN)
-		return
-	}
-
-	useClusterset := envBool("USE_CLUSTERSET_DNS", defaultUseCluster)
-	host := fmt.Sprintf("nats-bus.%s.svc.cluster.local", ns)
-	if useClusterset {
-		host = fmt.Sprintf("nats-bus.%s.svc.clusterset.local", ns)
-	}
-	clientURL = fmt.Sprintf("%s://%s:%d", scheme, host, 4222)
-
-	monPath := strings.TrimSpace(os.Getenv("PD_BUS_MON_PATH"))
-	if monPath == "" {
-		monPath = defaultMonPath
-	}
-	monitorURL = fmt.Sprintf("http://%s:%d%s", host, 8222, monPath)
-	hostFQDN = host
-	return
-}
-
-// Health check to NATS monitor endpoint (8222)
-// jsz → healthz 폴백
-func checkBusHealth(monitorURL string) bool {
-	if strings.TrimSpace(monitorURL) == "" {
-		return true
-	}
-	cl := &http.Client{Timeout: envDuration("PD_MON_HTTP_TIMEOUT", defaultHTTPTO)}
-	// 1) jsz
-	u1 := strings.TrimSuffix(monitorURL, "/healthz")
-	if u1 != "" {
-		u1 = fmt.Sprintf("%s/jsz", strings.TrimRight(u1, "/"))
-	}
-	if ok := doHTTP200(cl, u1); ok {
-		return true
-	}
-	// 2) healthz
-	return doHTTP200(cl, monitorURL)
-}
-
-func doHTTP200(cl *http.Client, u string) bool {
-	if strings.TrimSpace(u) == "" {
-		return false
-	}
-	req, _ := http.NewRequest("GET", u, nil)
-	resp, err := cl.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
-}
-
 // ──────────────────────────────────────────────────────────────
 // Reconcile
 func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -369,6 +287,8 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	requeueWhenPending := envDuration("PD_REQUEUE_PENDING", 10*time.Second)
 	hysteresisMargin := envInt32("PD_HYSTERESIS_MARGIN", defaultHysteresisMargin)
 	stickiness := envDuration("PD_STICKINESS", defaultStickiness)
+	maxClusters := envInt32("PD_MAX_CLUSTERS", 2)
+	multiMargin := envInt32("PD_MULTI_MARGIN", 80)
 
 	// 1) PD 로드
 	var pd orchestrationv1alpha1.PlacementDecision
@@ -379,9 +299,12 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, nil
 	}
 
-	// (옵션) 강제 재조정 플래그
+	// (옵션) 강제 재조정 플래그 (nil-safe)
 	forceKey := "orchestrator.operator.io/force-reconcile"
-	forced := strings.TrimSpace(pd.Annotations[forceKey]) != ""
+	forced := false
+	if pd.Annotations != nil {
+		forced = strings.TrimSpace(pd.Annotations[forceKey]) != ""
+	}
 
 	// 2) Owner Orchestrator
 	orch, ok := loadOwnerOrchestrator(ctx, r.Client, &pd)
@@ -458,69 +381,105 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		raws[cName] = rawScore{CPU: cpuVal, Mem: memVal, GPU: gpuVal, Lat: latVal, Final: final}
 	}
 
-	// 7) best + 히스테리시스/스티키니스
-	prev := ""
+	// 7) primary(best) + multi-selection with hysteresis/stickiness
+	prevPrimary := ""
 	var prevAt *metav1.Time
 	if len(pd.Status.Selected) > 0 {
-		prev = pd.Status.Selected[0].Cluster
+		prevPrimary = pd.Status.Selected[0].Cluster
 		prevAt = pd.Status.Updated
 	}
 
+	// sort by score desc
 	sort.SliceStable(candidates, func(i, j int) bool { return raws[candidates[i]].Final > raws[candidates[j]].Final })
-	best := candidates[0]
-	if prev != "" {
-		if best != prev {
-			if raws[best].Final < raws[prev].Final+hysteresisMargin {
-				best = prev
+
+	primary := candidates[0]
+	if prevPrimary != "" {
+		if primary != prevPrimary {
+			// keep previous primary if the difference is within hysteresis or stickiness window not elapsed
+			if raws[primary].Final < raws[prevPrimary].Final+hysteresisMargin {
+				primary = prevPrimary
 			}
 			if prevAt != nil && time.Since(prevAt.Time) < stickiness {
-				best = prev
+				primary = prevPrimary
 			}
 		}
 	}
 
-	newSelected := []orchestrationv1alpha1.SelectedCluster{{Cluster: best}}
-	sameSel := (len(pd.Status.Selected) == 1 && pd.Status.Selected[0].Cluster == best)
+	// Build desired selection list
+	desired := make([]orchestrationv1alpha1.SelectedCluster, 0, max(1, int(maxClusters)))
+	desired = append(desired, orchestrationv1alpha1.SelectedCluster{Cluster: primary})
 
-	// 8) EB 홈/BusURL/MonitorURL 결정 (PD가 권위자)
-	home := decideEBHome(&pd, best)
-	scheme, hostFQDN, busURL, monitorURL := buildBusURLs(pd.Namespace)
-
-	// 허브(=home) 헬스체크 → 불건강하면 다음 후보로 EB 홈 전환
-	healthy := checkBusHealth(monitorURL)
-	if !healthy && len(candidates) > 1 {
-		for _, cName := range candidates {
-			if cName != best {
-				home = cName
-				break
+	// Keep previously selected (besides primary) if still reasonable and capacity allows
+	prevSet := make(map[string]struct{}, len(pd.Status.Selected))
+	for _, s := range pd.Status.Selected {
+		prevSet[s.Cluster] = struct{}{}
+	}
+	// preserve order: previously selected (excluding primary) that are still within margin
+	for _, s := range pd.Status.Selected {
+		if s.Cluster == primary {
+			continue
+		}
+		if raws[s.Cluster].Final >= raws[primary].Final-multiMargin && len(desired) < int(maxClusters) {
+			// avoid duplicates
+			exists := false
+			for _, d := range desired {
+				if d.Cluster == s.Cluster {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				desired = append(desired, orchestrationv1alpha1.SelectedCluster{Cluster: s.Cluster})
 			}
 		}
-		// clusterset DNS면 동일 URL로 라우팅이 바뀐다고 가정
+	}
+	// fill with new candidates within margin until maxClusters
+	for _, cName := range candidates {
+		if cName == primary {
+			continue
+		}
+		if len(desired) >= int(maxClusters) {
+			break
+		}
+		if raws[cName].Final >= raws[primary].Final-multiMargin {
+			exists := false
+			for _, d := range desired {
+				if d.Cluster == cName {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				desired = append(desired, orchestrationv1alpha1.SelectedCluster{Cluster: cName})
+			}
+		}
 	}
 
-	ebHome := home
+	// helper to compare selections
+	sameSel := func(a, b []orchestrationv1alpha1.SelectedCluster) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i].Cluster != b[i].Cluster {
+				return false
+			}
+		}
+		return true
+	}(pd.Status.Selected, desired)
 
 	// 강제 재조정이면 주석 제거(1회성) 및 진행
 	if forced {
-		if pd.Annotations == nil {
-			pd.Annotations = map[string]string{}
+		if pd.Annotations != nil {
+			delete(pd.Annotations, forceKey)
+			_ = r.Update(ctx, &pd)
 		}
-		delete(pd.Annotations, forceKey)
-		_ = r.Update(ctx, &pd)
 	}
 
-	// 9) stable이면 빠르게 리턴 (단, EventInfra가 바뀌었으면 갱신)
-	needsEvtInfraUpdate :=
-		pd.Status.EventInfra == nil ||
-			pd.Status.EventInfra.EventBusHome != ebHome ||
-			pd.Status.EventInfra.BusURL != busURL ||
-			pd.Status.EventInfra.GlobalNATSServiceName != "nats-bus"
-
-	if sameSel && !needsEvtInfraUpdate && !forced {
+	// stable selection: if same selection and not forced, requeue after stable interval
+	if sameSel && !forced {
 		log.V(1).Info("stable selection",
-			"selected", best, "final", raws[best].Final,
-			"home", ebHome, "healthy", healthy,
-			"busURL", busURL, "host", hostFQDN, "scheme", scheme)
+			"selected", primary, "final", raws[primary].Final)
 		return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
 	}
 
@@ -535,16 +494,21 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 				CPU:     int32(math.Round(rv.CPU * 1000)),
 				Mem:     int32(math.Round(rv.Mem * 1000)),
 				GPU:     int32(math.Round(rv.GPU * 1000)),
-				Lat:     int32(math.Round(rv.Lat * 1000)),
 				Final:   rv.Final,
 			})
 		}
 		return out
 	}()
 
-	pd.Status.Selected = newSelected
+	pd.Status.Selected = desired
 	pd.Status.Scores = toScores
-	pd.Status.Reason = fmt.Sprintf("best=%s final=%d healthy=%v", best, raws[best].Final, healthy)
+	// reason string with primary and selection set
+	selNames := make([]string, 0, len(desired))
+	for _, s := range desired {
+		selNames = append(selNames, s.Cluster)
+	}
+	pd.Status.Reason = fmt.Sprintf("primary=%s selected=[%s]", primary, strings.Join(selNames, ","))
+
 	pd.Status.Updated = &now
 	pd.Status.Debug = &orchestrationv1alpha1.PlacementDebug{
 		PromURL: r.PromURL,
@@ -556,29 +520,12 @@ func (r *PlacementDecisionReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		},
 	}
 
-	// EventInfra 확정 (PD = 권위자)
-	if pd.Status.EventInfra == nil {
-		pd.Status.EventInfra = &orchestrationv1alpha1.EventInfraStatus{}
-	}
-	pd.Status.EventInfra.EventBusHome = ebHome
-	pd.Status.EventInfra.GlobalNATSServiceName = "nats-bus"
-	pd.Status.EventInfra.NatsBackendSelector = map[string]string{
-		"controller":    "eventbus-controller",
-		"eventbus-name": "default",
-	}
-	pd.Status.EventInfra.BusURL = busURL
-
 	if err := r.Status().Update(ctx, &pd); err != nil {
 		return ctrl.Result{}, err
 	}
 	log.Info("PD updated",
-		"selected", best,
-		"final", raws[best].Final,
-		"ebHome", ebHome,
-		"busURL", busURL,
-		"monitorURL", monitorURL,
-		"host", hostFQDN,
-		"healthy", healthy,
+		"selected", primary,
+		"final", raws[primary].Final,
 	)
 	return ctrl.Result{RequeueAfter: requeueWhenStable}, nil
 }
@@ -597,13 +544,4 @@ func (r *PlacementDecisionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// ──────────────────────────────────────────────────────────────
-// 작은 유틸 (호스트:포맷 유효성 검사) — (옵션) 필요 시 사용
-func validHostPort(hp string) bool {
-	host, portStr, err := net.SplitHostPort(hp)
-	if err != nil || host == "" || portStr == "" {
-		return false
-	}
-	_, err = strconv.Atoi(portStr)
-	return err == nil
-}
+// The selection logic computes both a primary and optional additional clusters for multi-placement.
