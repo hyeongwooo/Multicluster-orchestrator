@@ -582,6 +582,7 @@ func renderEventSources(orch *orchestrationv1alpha1.Orchestrator) []*uobj.Unstru
 						"port":     fmt.Sprintf("%d", es.Port),
 						"endpoint": endpoint,
 						"method":   method,
+						"jsonBody": true,
 					},
 				},
 			},
@@ -671,15 +672,24 @@ func serviceURLFor(svcName string, orch *orchestrationv1alpha1.Orchestrator, svc
 func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, svcURL map[string]string) *uobj.Unstructured {
 	name := nameWT(orch.Spec.EventName)
 
+	// Step 1: build the main steps. Each step forwards workflow-level parameters to the child template.
 	stepsNested := []any{}
 	for _, svc := range orch.Spec.Services {
 		step := map[string]any{
 			"name":     svc.Name,
 			"template": svc.Name,
+			"arguments": map[string]any{
+				"parameters": []any{
+					map[string]any{"name": "sensorName", "value": "{{workflow.parameters.sensorName}}"},
+					map[string]any{"name": "subscriptionID", "value": "{{workflow.parameters.subscriptionID}}"},
+					map[string]any{"name": "timestamp", "value": "{{workflow.parameters.timestamp}}"},
+				},
+			},
 		}
 		stepsNested = append(stepsNested, []any{step})
 	}
 
+	// Step 2: start templates array with the main steps template.
 	templates := []any{
 		map[string]any{
 			"name":  "main",
@@ -687,23 +697,38 @@ func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, svcURL map
 		},
 	}
 
+	// Step 3: add one HTTP template per service. Each template declares inputs and uses them in the JSON body.
 	for _, svc := range orch.Spec.Services {
 		baseURL := serviceURLFor(svc.Name, orch, svcURL)
 		path := "/" + svc.Name
 		finalURL := strings.TrimRight(baseURL, "/") + path
+
 		tmpl := map[string]any{
 			"name": svc.Name,
+			"inputs": map[string]any{
+				"parameters": []any{
+					map[string]any{"name": "sensorName"},
+					map[string]any{"name": "subscriptionID"},
+					map[string]any{"name": "timestamp"},
+				},
+			},
 			"http": map[string]any{
 				"url":    finalURL,
 				"method": "POST",
 				"headers": []any{
 					map[string]any{"name": "Content-Type", "value": "application/json"},
 				},
+				"body": `{
+  "subscriptionID": "{{inputs.parameters.subscriptionID}}",
+  "sensorName": "{{inputs.parameters.sensorName}}",
+  "timestamp": "{{inputs.parameters.timestamp}}"
+}`,
 			},
 		}
 		templates = append(templates, tmpl)
 	}
 
+	// Step 4: build the WorkflowTemplate with top-level arguments.
 	u := &uobj.Unstructured{}
 	u.Object = map[string]any{
 		"apiVersion": "argoproj.io/v1alpha1",
@@ -714,7 +739,14 @@ func renderWorkflowTemplate(orch *orchestrationv1alpha1.Orchestrator, svcURL map
 		},
 		"spec": map[string]any{
 			"entrypoint": "main",
-			"templates":  templates,
+			"arguments": map[string]any{
+				"parameters": []any{
+					map[string]any{"name": "sensorName"},
+					map[string]any{"name": "subscriptionID"},
+					map[string]any{"name": "timestamp"},
+				},
+			},
+			"templates": templates,
 		},
 	}
 	return u
@@ -973,7 +1005,7 @@ func (r *OrchestratorReconciler) renderBase(
 
 	var sn *uobj.Unstructured
 	if len(orch.Spec.EventSources) > 0 {
-		// build sensor from list of event sources using EventLogic if provided
+		// Build one trigger per dependency to avoid overwriting parameters with empty values
 		sensorName := nameSN(orch.Spec.EventName)
 		wtName := nameWT(orch.Spec.EventName)
 
@@ -995,32 +1027,76 @@ func (r *OrchestratorReconciler) renderBase(
 			"kind":       "Workflow",
 			"metadata":   map[string]any{"generateName": fmt.Sprintf("%s-", orch.Spec.EventName)},
 			"spec": map[string]any{
-				"serviceAccountName":  "operate-workflow-sa",
-				"entrypoint":          "main",
+				"serviceAccountName": "operate-workflow-sa",
+				"entrypoint":         "main",
+				"arguments": map[string]any{
+					"parameters": []any{
+						map[string]any{"name": "sensorName", "value": ""},
+						map[string]any{"name": "subscriptionID", "value": ""},
+						map[string]any{"name": "timestamp", "value": ""},
+					},
+				},
 				"workflowTemplateRef": map[string]any{"name": wtName},
 			},
 		}
 
-		trigger := map[string]any{
-			"template": map[string]any{
-				"name": sensorName + "-trigger",
-				"argoWorkflow": map[string]any{
-					"operation": "submit",
-					"source":    map[string]any{"resource": wfObj},
+		// Build one trigger per dependency to avoid overwriting parameters with empty values
+		triggers := []any{}
+		for _, es := range orch.Spec.EventSources {
+			if strings.TrimSpace(es.Name) == "" {
+				continue
+			}
+
+			// parameters for ONLY this dependency
+			params := []any{
+				map[string]any{
+					"src":  map[string]any{"dependencyName": es.Name, "dataKey": "body.sensorName"},
+					"dest": "spec.arguments.parameters.0.value",
 				},
-			},
-		}
-		if strings.TrimSpace(orch.Spec.EventLogic) != "" {
-			trigger["conditions"] = orch.Spec.EventLogic
+				map[string]any{
+					"src":  map[string]any{"dependencyName": es.Name, "dataKey": "body.subscriptionID"},
+					"dest": "spec.arguments.parameters.1.value",
+				},
+				map[string]any{
+					"src":  map[string]any{"dependencyName": es.Name, "dataKey": "body.timestamp"},
+					"dest": "spec.arguments.parameters.2.value",
+				},
+			}
+
+			t := map[string]any{
+				"conditions": es.Name,
+				"template": map[string]any{
+					"name": sensorName + "-trigger-" + es.Name,
+					"argoWorkflow": map[string]any{
+						"operation":  "submit",
+						"source":     map[string]any{"resource": wfObj},
+						"parameters": params,
+					},
+				},
+			}
+
+			triggers = append(triggers, t)
 		}
 
 		spec := map[string]any{
 			"template": map[string]any{
 				"eventBusName":       eventBusName, // "default" 등
 				"serviceAccountName": "operate-workflow-sa",
+				"container": map[string]any{
+					"resources": map[string]any{
+						"requests": map[string]any{
+							"cpu":    "50m",
+							"memory": "50Mi",
+						},
+						"limits": map[string]any{
+							"cpu":    "1",
+							"memory": "500Mi",
+						},
+					},
+				},
 			},
 			"dependencies": dependencies,
-			"triggers":     []any{trigger},
+			"triggers":     triggers,
 		}
 
 		sn = &uobj.Unstructured{}
